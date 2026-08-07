@@ -1,0 +1,15 @@
+.env
+config.local.js
+card.json
+cards.json
+tiktok_session.json
+*.log
+node_modules/
+screenshots/
+temp/
+uploads/
+auth.json
+tiktok_proxy_data/
+tiktok_secure_data/
+tiktok_user_data/
+backup_old/
