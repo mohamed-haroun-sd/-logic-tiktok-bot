@@ -274,7 +274,7 @@ async function login() {
 async function checkTikTokSession(page) {
     try {
         await page.goto('https://www.tiktok.com/login', { waitUntil: 'domcontentloaded', timeout: 15000 });
-        await sleep(3000);
+        await sleep(2000);
 
         // If logged in, TikTok redirects to home or shows logged-in UI
         const url = page.url();
@@ -302,7 +302,7 @@ async function doQRLogin(page) {
             waitUntil: 'domcontentloaded',
             timeout: 20000
         });
-        await sleep(3000);
+        await sleep(2000);
 
         // Click QR code option if available
         const qrTab = await page.locator('[data-e2e="qr-code"], [class*="qrCode"], text=QR code').first();
@@ -357,7 +357,7 @@ async function waitForQRScan(page, timeoutMs = 120000) {
             }
         } catch {}
 
-        await sleep(3000);
+        await sleep(2000);
     }
 
     return false; // Timeout

@@ -7521,9 +7521,9 @@ def api_tiktok_order():
             "code": "insufficient_balance"
         })
 
-    # ═══ خصم الرصيد فوراً
-    db.sub_bal(uid, price_usd)
-
+    # ═══ خصم الرصيد فوراً    db.sub_bal(uid, price_usd)
+    # ═══ CHECK AUTO MODE ═══
+    auto_mode = bool(data.get("auto_mode", False))
     custom_tag = " (مخصص)" if is_custom else ""
     subj = f"🎵 شحن {coins} عملة تيك توك{custom_tag}"
     desc = (
@@ -7537,7 +7537,10 @@ def api_tiktok_order():
         desc += f"\n📞 واتساب (اختياري): {whatsapp}\n"
     if notes:
         desc += f"\n📝 ملاحظات:\n{notes}\n"
-
+    # ═══ AUTO MODE: لا تنشئ تذكرة — البوت يسحب الطلب مباشرة ═══
+    if auto_mode:
+        db.save()
+        return jsonify({"ok": True, "order_id": order_id, "new_balance": db.get_bal(uid), "mode": "auto", "message": "بتم التنفيذ تلقائياً"})
     tid = str(len(db.tickets) + 1)
     now = time.strftime("%d/%m %H:%M")
     db.tickets[tid] = {
@@ -33179,6 +33182,7 @@ async function submitTtOrder(){
       price_usd: priceUsd,
       price_iqd: priceIqd,
       is_custom: isCustom,
+      auto_mode: true,
       notes: notes.trim(),
       whatsapp: wa
     });
