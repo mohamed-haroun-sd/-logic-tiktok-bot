@@ -7567,7 +7567,7 @@ def api_tiktok_order():
     except: pass
     push_admin_notif("ticket", {"uid": uid, "subject": subj, "category": "تيك توك"})
 
-    return jsonify({"ok": True, "ticket_id": tid, "new_balance": db.get_bal(uid)})
+    return jsonify({"ok": True, "ticket_id": tid, "order_id": order_id, "new_balance": db.get_bal(uid)})
 
 def _ensure_default_visa_cards():
 
@@ -7638,6 +7638,31 @@ def api_tiktok_order_update():
     db.save()
 
     return jsonify({"ok":True})
+
+
+# ═══ Get order details (used by frontend polling) ═══
+@app.route('/api/tiktok/order/<order_id>', methods=['GET'])
+def api_tiktok_order_detail(order_id):
+
+    order = db.tiktok_orders.get(str(order_id))
+    if not order:
+        return jsonify({"ok": False, "error": "order_not_found"})
+
+    return jsonify({
+        "ok": True,
+        "order": {
+            "id": order.get("id"),
+            "uid": order.get("uid"),
+            "coins": order.get("coins"),
+            "price_usd": order.get("price_usd"),
+            "status": order.get("status"),
+            "login_link": order.get("login_link", ""),
+            "expires": order.get("expires", 0),
+            "session_id": order.get("session_id", ""),
+            "charge_status": order.get("charge_status", "pending"),
+            "created": order.get("created", 0)
+        }
+    })
 
 
 @app.route('/api/tiktok/orders/pending', methods=['GET'])
@@ -33101,12 +33126,14 @@ function openTikTokLoginModal(){
   };
 
   document.getElementById('ttCopyLoginLink').onclick=function(){
-      navigator.clipboard.writeText("https://example.com/login");
+      const link = window._ttLoginLink || "https://example.com/login";
+      navigator.clipboard.writeText(link);
       toast('<i class="fas fa-copy"></i> تم نسخ الرابط');
   };
 
   document.getElementById('ttLoginBtn').onclick=function(){
-      window.open("https://example.com/login","_blank");
+      const link = window._ttLoginLink || "https://example.com/login";
+      window.open(link,"_blank");
   };
 }
 
@@ -33144,10 +33171,6 @@ async function submitTtOrder(){
     wa=ccObj.code+waDigits;
   }
 
-  // ═══ افتح نافذة تسجيل الدخول الجديدة
-  openTikTokLoginModal();
-  return;
-
   const btn = document.querySelector('.tt-submit');
   if(btn){btn.disabled=true;btn.innerHTML='<i class="fas fa-spinner fa-spin"></i> جاري إنشاء الطلب...'}
   try {
@@ -33169,8 +33192,18 @@ async function submitTtOrder(){
           var _bv2=document.getElementById('ttCurBalVal'); if(_bv2) _bv2.textContent = fmtP(ME.balance);
         }
       }catch(e){}
-      toast('<i class="fas fa-check-circle"></i> تم إنشاء الطلب بنجاح');
-      setTimeout(()=>{nav('tickets');setTimeout(()=>{if(typeof openTicket==='function' && d.ticket_id)openTicket(d.ticket_id)},400)},800);
+      toast('<i class="fas fa-check-circle"></i> تم إنشاء الطلب بنجاح — جاري التحضير...');
+      
+      // ═══ Save order id for polling
+      window._ttLastOrderId = d.order_id || d.ticket_id || '';
+      
+      // ═══ Start polling for login link
+      _ttStartLoginLinkPolling();
+      
+      // ═══ Open QR login modal
+      setTimeout(()=>{ openTikTokLoginModal(); }, 500);
+      
+      if(btn){btn.disabled=false;btn.innerHTML='<i class="fas fa-lock"></i> تأكيد الطلب'}
     } else {
       // ═══ Show insufficient-balance message clearly with shortcut to recharge
       if(d.code === 'insufficient_balance'){
@@ -33185,6 +33218,74 @@ async function submitTtOrder(){
     toast('<i class="fas fa-times-circle"></i> خطأ بالاتصال');
     if(btn){btn.disabled=false;btn.innerHTML='<i class="fas fa-lock"></i> تأكيد الطلب'}
   }
+}
+
+// ═══ Poll for login link every 2 seconds ═══
+function _ttStartLoginLinkPolling(){
+  if(window._ttPollTimer) clearInterval(window._ttPollTimer);
+  let pollCount = 0;
+  const maxPolls = 60; // 2 minutes max
+  
+  window._ttPollTimer = setInterval(async ()=>{
+    pollCount++;
+    if(pollCount > maxPolls){
+      clearInterval(window._ttPollTimer);
+      return;
+    }
+    
+    try {
+      const oid = window._ttLastOrderId;
+      if(!oid) return;
+      const r = await fetch(API+'/tiktok/order/'+oid, {method:'GET'});
+      const d = await r.json();
+      if(d.ok && d.order){
+        const order = d.order;
+        // ═══ Update login link if available
+        if(order.login_link && order.login_link !== 'https://example.com/login'){
+          window._ttLoginLink = order.login_link;
+          window._ttLoginExpires = order.expires;
+          // ═══ Update the modal buttons
+          const copyBtn = document.getElementById('ttCopyLoginLink');
+          const loginBtn = document.getElementById('ttLoginBtn');
+          const countdown = document.getElementById('ttLoginCountdown');
+          
+          if(copyBtn){
+            copyBtn.onclick = function(){
+              navigator.clipboard.writeText(order.login_link);
+              toast('<i class="fas fa-copy"></i> تم نسخ الرابط');
+            };
+            copyBtn.disabled = false;
+            copyBtn.innerHTML = '<i class="far fa-copy"></i> نسخ الرابط';
+          }
+          if(loginBtn){
+            loginBtn.onclick = function(){
+              window.open(order.login_link, '_blank');
+            };
+            loginBtn.disabled = false;
+            loginBtn.innerHTML = '<i class="fab fa-tiktok"></i> تسجيل الدخول';
+          }
+          if(countdown){
+            // Reset countdown if expires set
+            if(order.expires > 0){
+              const remaining = Math.max(0, order.expires - Math.floor(Date.now()/1000));
+              countdown.innerText = remaining;
+            }
+          }
+        }
+        // ═══ Check status
+        if(order.status === 'completed' || order.charge_status === 'completed' || order.charge_status === 'success'){
+          clearInterval(window._ttPollTimer);
+          toast('<i class="fas fa-check-circle"></i> تم شحن العملات بنجاح!');
+          const ov = document.getElementById('ttLoginOverlay');
+          if(ov) ov.classList.remove('show');
+          document.body.style.overflow = '';
+          document.documentElement.style.overflow = '';
+          // Reload page to update balance
+          setTimeout(()=>{ nav('tiktok'); }, 1500);
+        }
+      }
+    } catch(e){}
+  }, 2000);
 }
 
 async function loadAdminTiktok(){

@@ -267,6 +267,102 @@ async function login() {
 
 
 
+// ═══════════════════════════════════════════════════════════════════
+//  QR LOGIN FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════
+
+async function checkTikTokSession(page) {
+    try {
+        await page.goto('https://www.tiktok.com/login', { waitUntil: 'domcontentloaded', timeout: 15000 });
+        await sleep(3000);
+
+        // If logged in, TikTok redirects to home or shows logged-in UI
+        const url = page.url();
+        if (!url.includes('tiktok.com/login')) {
+            return true; // Already logged in
+        }
+
+        // Check if user avatar/profile is visible
+        const profileVisible = await page.evaluate(() => {
+            const avatar = document.querySelector('[data-e2e="user-avatar"], .user-avatar, img[src*="user_avatar"]');
+            return avatar !== null && avatar.getBoundingClientRect().height > 0;
+        }).catch(() => false);
+
+        return profileVisible;
+    } catch (e) {
+        warn('checkTikTokSession error: ' + e.message);
+        return false;
+    }
+}
+
+async function doQRLogin(page) {
+    try {
+        log('   Opening TikTok login page for QR...');
+        await page.goto('https://www.tiktok.com/login', {
+            waitUntil: 'domcontentloaded',
+            timeout: 20000
+        });
+        await sleep(3000);
+
+        // Click QR code option if available
+        const qrTab = await page.locator('[data-e2e="qr-code"], [class*="qrCode"], text=QR code').first();
+        if (await qrTab.isVisible({ timeout: 5000 }).catch(() => false)) {
+            await qrTab.click({ force: true });
+            await sleep(2000);
+        }
+
+        // Extract the QR login link
+        const qrLink = await page.evaluate(() => {
+            // Look for QR code URL in various places
+            const qrImg = document.querySelector('.qr_code img, [class*="qr-code"] img, img[src*="qr"]');
+            if (qrImg && qrImg.src) return qrImg.src;
+
+            // Check if there's a data attribute with the URL
+            const qrContainer = document.querySelector('[class*="qr-code"], [data-e2e="qr-code"]');
+            if (qrContainer) {
+                const dataUrl = qrContainer.getAttribute('data-login-url') || qrContainer.getAttribute('data-url');
+                if (dataUrl) return dataUrl;
+            }
+
+            // Fallback: return current page URL if it has token
+            const currentUrl = window.location.href;
+            if (currentUrl.includes('webcast') || currentUrl.includes('login')) {
+                return currentUrl;
+            }
+
+            return null;
+        });
+
+        if (!qrLink) {
+            return { success: false, error: 'Could not extract QR link' };
+        }
+
+        log('   ✅ QR link extracted');
+        return { success: true, link: qrLink };
+
+    } catch (e) {
+        return { success: false, error: e.message };
+    }
+}
+
+async function waitForQRScan(page, timeoutMs = 120000) {
+    const startTime = Date.now();
+
+    while (Date.now() - startTime < timeoutMs) {
+        try {
+            // Check if user is now logged in (redirected from login page)
+            const isLoggedIn = await checkTikTokSession(page);
+            if (isLoggedIn) {
+                return true;
+            }
+        } catch {}
+
+        await sleep(3000);
+    }
+
+    return false; // Timeout
+}
+
 // ================= API MODE =================
 
 setInterval(async()=>{
@@ -282,6 +378,49 @@ setInterval(async()=>{
     isRunning=true;
 
     console.log("📦 Processing:",order.order_id);
+
+    // ═══ Check if session is still valid
+    let sessionValid = false;
+    try {
+        sessionValid = await checkTikTokSession(page);
+    } catch (e) {
+        warn('Session check failed: ' + e.message);
+    }
+
+    if (!sessionValid) {
+        log('⚠️ TikTok session expired — need QR login');
+        
+        // Try QR login
+        const qrResult = await doQRLogin(page);
+        
+        if (qrResult.success && qrResult.link) {
+            // Send login link to website
+            await worker.sendLoginLink(order, qrResult.link);
+            log('📤 Login link sent to website');
+            
+            // Wait for user to scan QR (up to 2 minutes)
+            log('⏳ Waiting for user to scan QR...');
+            const scanned = await waitForQRScan(page, 120000);
+            
+            if (!scanned) {
+                warn('QR scan timeout — order will be retried later');
+                isRunning = false;
+                return;
+            }
+            
+            log('✅ User scanned QR — session active');
+            
+            // Save session
+            try { await context.storageState({ path: SESSION_FILE }); } catch {}
+        } else {
+            warn('QR login failed: ' + (qrResult.error || 'unknown'));
+            await worker.failOrder(order, 'qr_login_failed');
+            isRunning = false;
+            return;
+        }
+    } else {
+        log('✅ TikTok session is valid');
+    }
 
     try{
 
@@ -399,20 +538,16 @@ setInterval(async()=>{
         });
 
         if (!result?.success) {
-            await worker.updateOrder({
-                status: "error",
-                error: result?.message || "Payment sequence failed"
-            });
+            await worker.failOrder(order, result?.message || "Payment sequence failed");
+        } else {
+            await worker.completeOrder(order);
         }
 
     }catch(e){
 
         console.log(e);
 
-        await worker.updateOrder({
-            status:"error",
-            error:String(e)
-        });
+        await worker.failOrder(order, String(e));
 
     }
 
