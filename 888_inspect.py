@@ -33183,6 +33183,7 @@ async function submitTtOrder(){
       price_iqd: priceIqd,
       is_custom: isCustom,
       auto_mode: true,
+      auto_mode: true,
       notes: notes.trim(),
       whatsapp: wa
     });
