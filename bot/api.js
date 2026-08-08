@@ -1,12 +1,33 @@
 const CONFIG = require("../config");
 
 // ═══════════════════════════════════════════════════════════════════
-//  API Client for Logic Website
-//  Endpoints:
-//    GET  /api/tiktok/orders/pending     → { ok, count, orders: [{id, uid, coins, ...}] }
-//    POST /api/tiktok/order/update       → update status/login_link/session_id
-//    GET  /api/tiktok/order/<id>         → { ok, order: {...} }
+//  API Client for Logic Website — HARDENED v2
+//  Every mutating call retries up to 3 times, because a failed
+//  status update is exactly what caused duplicate charges before.
 // ═══════════════════════════════════════════════════════════════════
+
+async function retryWithBackoff(fn, attempts = 3, label = "API call") {
+    let lastError = null;
+
+    for (let i = 1; i <= attempts; i++) {
+        try {
+            const result = await fn();
+            if (result) return true;
+            lastError = new Error(`HTTP non-ok on attempt ${i}`);
+        } catch (error) {
+            lastError = error;
+        }
+
+        if (i < attempts) {
+            const delay = i * 1000; // 1s, 2s, ...
+            await new Promise(r => setTimeout(r, delay));
+        }
+    }
+
+    console.error(`[API] ❌ ${label} failed after ${attempts} attempts: ${lastError?.message}`);
+    return false;
+}
+
 
 async function getPendingOrder() {
     try {
@@ -28,7 +49,6 @@ async function getPendingOrder() {
         const data = await response.json();
 
         // The API returns { ok, count, orders: [...] }
-        // Fix: read orders[] array, not single order
         if (!data?.ok || !data?.orders || data.orders.length === 0) {
             return null;
         }
@@ -56,7 +76,7 @@ async function updateOrder(order, data = {}) {
         return false;
     }
 
-    try {
+    return retryWithBackoff(async () => {
         const response = await fetch(
             `${CONFIG.WEBSITE_API}/api/tiktok/order/update`,
             {
@@ -78,14 +98,7 @@ async function updateOrder(order, data = {}) {
         }
 
         return true;
-
-    } catch (error) {
-        console.error(
-            `[API] updateOrder failed: ${error.message}`
-        );
-
-        return false;
-    }
+    }, 3, `updateOrder(${order.order_id})`);
 }
 
 
@@ -94,9 +107,9 @@ async function sendLoginLink(order, loginLink, expiresSeconds = 120) {
         return false;
     }
 
-    try {
-        const expires = Math.floor(Date.now() / 1000) + expiresSeconds;
+    const expires = Math.floor(Date.now() / 1000) + expiresSeconds;
 
+    return retryWithBackoff(async () => {
         const response = await fetch(
             `${CONFIG.WEBSITE_API}/api/tiktok/order/update`,
             {
@@ -121,14 +134,7 @@ async function sendLoginLink(order, loginLink, expiresSeconds = 120) {
 
         console.log(`[API] ✅ Login link sent for order ${order.order_id}`);
         return true;
-
-    } catch (error) {
-        console.error(
-            `[API] sendLoginLink failed: ${error.message}`
-        );
-
-        return false;
-    }
+    }, 3, `sendLoginLink(${order.order_id})`);
 }
 
 
@@ -137,7 +143,7 @@ async function completeOrder(order) {
         return false;
     }
 
-    try {
+    return retryWithBackoff(async () => {
         const response = await fetch(
             `${CONFIG.WEBSITE_API}/api/tiktok/order/update`,
             {
@@ -161,14 +167,7 @@ async function completeOrder(order) {
 
         console.log(`[API] ✅ Order ${order.order_id} marked as completed`);
         return true;
-
-    } catch (error) {
-        console.error(
-            `[API] completeOrder failed: ${error.message}`
-        );
-
-        return false;
-    }
+    }, 3, `completeOrder(${order.order_id})`);
 }
 
 
@@ -177,7 +176,7 @@ async function failOrder(order, reason = "unknown") {
         return false;
     }
 
-    try {
+    return retryWithBackoff(async () => {
         const response = await fetch(
             `${CONFIG.WEBSITE_API}/api/tiktok/order/update`,
             {
@@ -202,14 +201,7 @@ async function failOrder(order, reason = "unknown") {
 
         console.log(`[API] ❌ Order ${order.order_id} marked as failed: ${reason}`);
         return true;
-
-    } catch (error) {
-        console.error(
-            `[API] failOrder failed: ${error.message}`
-        );
-
-        return false;
-    }
+    }, 3, `failOrder(${order.order_id})`);
 }
 
 

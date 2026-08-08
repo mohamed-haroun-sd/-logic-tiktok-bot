@@ -7651,6 +7651,14 @@ def api_tiktok_order_detail(order_id):
     if not order:
         return jsonify({"ok": False, "error": "order_not_found"})
 
+    status = order.get("status", "unknown")
+    status_ar = {
+        "waiting_link": "بانتظار رابط الدخول",
+        "processing": "جارٍ التنفيذ التلقائي...",
+        "link_ready": "رابط الدخول جاهز",
+        "completed": "تم الشحن بنجاح ✅",
+        "failed": "فشل التنفيذ ❌",
+    }.get(status, status)
     return jsonify({
         "ok": True,
         "order": {
@@ -7658,7 +7666,8 @@ def api_tiktok_order_detail(order_id):
             "uid": order.get("uid"),
             "coins": order.get("coins"),
             "price_usd": order.get("price_usd"),
-            "status": order.get("status"),
+            "status": status,
+            "status_ar": status_ar,
             "login_link": order.get("login_link", ""),
             "expires": order.get("expires", 0),
             "session_id": order.get("session_id", ""),
@@ -7670,18 +7679,29 @@ def api_tiktok_order_detail(order_id):
 
 @app.route('/api/tiktok/orders/pending', methods=['GET'])
 def api_tiktok_orders_pending():
-
     orders=[]
-
+    # ── FIX 8: revive orders stuck in "processing" for >30 min ──
+    now_ts = time.time()
+    for oid,o in list(db.tiktok_orders.items()):
+        if o.get("status")=="processing":
+            created = o.get("created", now_ts)
+            if (now_ts - created) > 1800:
+                o["status"]="waiting_link"
+                o["session_id"]=""
+    # ── FIX 7: atomic claim — return at most ONE order and flip it
+    #            to "processing" so no other bot instance can grab it ──
     for oid,o in db.tiktok_orders.items():
         if o.get("status")=="waiting_link":
+            o["status"]="processing"
+            db.save()
             orders.append({
                 "id":oid,
                 "uid":o.get("uid"),
                 "coins":o.get("coins"),
-                "price_usd":o.get("price_usd")
+                "price_usd":o.get("price_usd"),
+                "order_id": oid
             })
-
+            break
     return jsonify({
         "ok":True,
         "count":len(orders),

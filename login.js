@@ -1,24 +1,40 @@
 // ═══════════════════════════════════════════════════════════════════
-//  TikTok Coins Auto-Payment Bot — v7 (IFRAME FIX)
-//  CRITICAL: Card fields are INSIDE a PipoPay iframe!
-//  iframe: https://pay-my.pipopay.com/pipo/fe/pipo_checkouts/
-// ═══════════════════════════════════════════════════════════════════
+//  TikTok Coins Auto-Payment Bot — v8 (HARDENED / NO-DUPLICATE)
+//
+//  CRITICAL SAFETY ARCHITECTURE (v8):
+//  ─────────────────────────────────────────────────────────────
+//  1. PID LOCKFILE  → impossible to run 2 instances simultaneously
+//  2. ATOMIC CLAIM  → order status → "processing" the moment it's
+//                     pulled, so no other instance can ever grab it
+//  3. ONE-TRY RULE  → each order gets EXACTLY ONE payment attempt.
+//                     Failed? Marked "failed" forever. The user
+//                     must re-confirm the order themselves.
+//  4. STEP FAILURE  → any step failing HALTS the whole sequence;
+//                     it can NEVER fall through to "Pay"
+//  5. PRE-PAY CHECK → the bot verifies card fields are actually
+//                     filled before it dares to press Pay
+//  6. POST-PAY CHECK→ success is confirmed via success screen,
+//                     not assumed
+//  7. GRACEFUL EXIT → SIGTERM closes browser + removes lockfile
+//  ═══════════════════════════════════════════════════════════════════
 
 const { chromium } = require('playwright-extra');
 const stealth = require('puppeteer-extra-plugin-stealth')();
 const express = require('express');
 const path = require('path');
 const fs = require('fs');
+const { spawnSync } = require('child_process');
 
-const CONFIG=require("./config");
-const worker=require("./bot/worker");
-const cards=require("./bot/cardsManager");
+const CONFIG = require("./config");
+const worker = require("./bot/worker");
+const cards = require("./bot/cardsManager");
 const { runFullSequence } = require("./data/runFullSequence");
 
 chromium.use(stealth);
 
 // ── Constants ──
 const PORT = 3000;
+const LOCKFILE = "/tmp/tiktok-bot.lock";
 const SESSION_FILE = CONFIG.SESSION_FILE;
 const CARD_FILE = CONFIG.CARD_FILE;
 const USER_DATA_DIR = path.join(__dirname, CONFIG.USER_DATA_DIR);
@@ -31,13 +47,12 @@ let context = null;
 let isRunning = false;
 let currentStep = 0;
 let progressMsg = 'Waiting for start...';
+let shutdownRequested = false;
 
-// ═══ Track processed order IDs to prevent re-processing ═══
+// ═══ Track processed order IDs so they are NEVER re-processed ═══
 const processedOrderIds = new Set();
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-
-
 const ts = () => new Date().toISOString().replace('T', ' ').slice(0, 19);
 
 function log(msg) { console.log(`[${ts()}] ${msg}`); }
@@ -48,20 +63,82 @@ function err(msg, e) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+//  PID LOCKFILE — prevent multiple instances at the OS level
+// ═══════════════════════════════════════════════════════════════════
+
+function acquireLock() {
+    try {
+        if (fs.existsSync(LOCKFILE)) {
+            const pid = parseInt(fs.readFileSync(LOCKFILE, 'utf8').trim(), 10);
+            if (pid && isPidAlive(pid)) {
+                console.error(`🚫 FATAL: Another instance is already running (PID ${pid}).`);
+                console.error(`   Kill it first:  kill -9 ${pid}`);
+                console.error(`   Or:  rm ${LOCKFILE}   (only if no instance is running)`);
+                process.exit(1);
+            }
+            warn(`Stale lockfile found (PID ${pid} dead) — removing`);
+            fs.unlinkSync(LOCKFILE);
+        }
+        fs.writeFileSync(LOCKFILE, String(process.pid));
+        log(`🔒 Lock acquired: PID ${process.pid} → ${LOCKFILE}`);
+    } catch (e) {
+        console.error(`🚫 FATAL: Could not create lockfile: ${e.message}`);
+        process.exit(1);
+    }
+}
+
+function releaseLock() {
+    try {
+        if (fs.existsSync(LOCKFILE)) {
+            const pid = parseInt(fs.readFileSync(LOCKFILE, 'utf8').trim(), 10);
+            if (pid === process.pid) {
+                fs.unlinkSync(LOCKFILE);
+                log(`🔓 Lock released`);
+            }
+        }
+    } catch {}
+}
+
+function isPidAlive(pid) {
+    try {
+        process.kill(pid, 0);
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+process.on('SIGINT', () => { shutdownRequested = true; gracefulExit(); });
+process.on('SIGTERM', () => { shutdownRequested = true; gracefulExit(); });
+process.on('uncaughtException', (e) => {
+    err('Uncaught exception', e);
+    gracefulExit();
+});
+
+async function gracefulExit() {
+    log('🛑 Shutting down gracefully...');
+    if (context) {
+        try { await context.storageState({ path: SESSION_FILE }); } catch {}
+        try { await context.close(); } catch {}
+    }
+    releaseLock();
+    log('✅ Bot stopped cleanly. No orphan processes.');
+    process.exit(0);
+}
+
+// ═══════════════════════════════════════════════════════════════════
 //  EXPRESS SERVER
 // ═══════════════════════════════════════════════════════════════════
 
 const app = express();
-app.use(express.json({limit:'5mb'}));
-
-
+app.use(express.json({ limit: '5mb' }));
 
 if (!fs.existsSync(SCREENSHOT_DIR)) fs.mkdirSync(SCREENSHOT_DIR, { recursive: true });
 if (!fs.existsSync(PUBLIC_DIR)) fs.mkdirSync(PUBLIC_DIR, { recursive: true });
 app.use('/static', express.static(PUBLIC_DIR));
 
 // Delete old screenshots
-['step1','step2','step3','step4'].forEach(name => {
+['step1', 'step2', 'step3', 'step4'].forEach(name => {
     const f = path.join(PUBLIC_DIR, `${name}.png`);
     if (fs.existsSync(f)) { fs.unlinkSync(f); log(`🗑️ Deleted old ${name}.png`); }
 });
@@ -149,7 +226,7 @@ app.get('/', (req, res) => {
             <img id="img1" src="" style="display:none" alt="Step 1">
         </div>
         <div class="step-card" id="card2">
-            <div class="step-label">⏳ 2 · Recharge & Select Card</div>
+            <div class="label">⏳ 2 · Recharge & Select Card</div>
             <div class="placeholder" id="img2wrap">No screenshot yet</div>
             <img id="img2" src="" style="display:none" alt="Step 2">
         </div>
@@ -212,18 +289,15 @@ app.get('/', (req, res) => {
 </html>`);
 });
 
-app.get('/run', async (req,res)=>{
-    res.json({
-        ok:true,
-        message:"Worker Ready"
-    });
+app.get('/run', (req, res) => {
+    res.json({ ok: true, message: "Worker Ready" });
 });
 
 // ═══════════════════════════════════════════════════════════════════
 //  BROWSER LAUNCH
 // ═══════════════════════════════════════════════════════════════════
 
-async function login() {
+async function launchBrowser() {
     log('🚀 Launching browser...');
 
     const launchOpts = {
@@ -265,28 +339,26 @@ async function login() {
         log('   3. Watch progress live');
         log('   4. DO NOT click again until done');
         log('');
+        log('🔒 Safety: only ONE instance can run at a time (PID lock)');
+        log('');
     });
 }
-
-
 
 // ═══════════════════════════════════════════════════════════════════
 //  QR LOGIN FUNCTIONS
 // ═══════════════════════════════════════════════════════════════════
 
-async function checkTikTokSession(page) {
+async function checkTikTokSession(pg) {
     try {
-        await page.goto('https://www.tiktok.com/login', { waitUntil: 'domcontentloaded', timeout: 15000 });
+        await pg.goto('https://www.tiktok.com/login', { waitUntil: 'domcontentloaded', timeout: 15000 });
         await sleep(2000);
 
-        // If logged in, TikTok redirects to home or shows logged-in UI
-        const url = page.url();
+        const url = pg.url();
         if (!url.includes('tiktok.com/login')) {
             return true; // Already logged in
         }
 
-        // Check if user avatar/profile is visible
-        const profileVisible = await page.evaluate(() => {
+        const profileVisible = await pg.evaluate(() => {
             const avatar = document.querySelector('[data-e2e="user-avatar"], .user-avatar, img[src*="user_avatar"]');
             return avatar !== null && avatar.getBoundingClientRect().height > 0;
         }).catch(() => false);
@@ -298,36 +370,31 @@ async function checkTikTokSession(page) {
     }
 }
 
-async function doQRLogin(page) {
+async function doQRLogin(pg) {
     try {
         log('   Opening TikTok login page for QR...');
-        await page.goto('https://www.tiktok.com/login', {
+        await pg.goto('https://www.tiktok.com/login', {
             waitUntil: 'domcontentloaded',
             timeout: 20000
         });
         await sleep(2000);
 
-        // Click QR code option if available
-        const qrTab = await page.locator('[data-e2e="qr-code"], [class*="qrCode"], text=QR code').first();
+        const qrTab = await pg.locator('[data-e2e="qr-code"], [class*="qrCode"], text=QR code').first();
         if (await qrTab.isVisible({ timeout: 5000 }).catch(() => false)) {
             await qrTab.click({ force: true });
             await sleep(2000);
         }
 
-        // Extract the QR login link
-        const qrLink = await page.evaluate(() => {
-            // Look for QR code URL in various places
+        const qrLink = await pg.evaluate(() => {
             const qrImg = document.querySelector('.qr_code img, [class*="qr-code"] img, img[src*="qr"]');
             if (qrImg && qrImg.src) return qrImg.src;
 
-            // Check if there's a data attribute with the URL
             const qrContainer = document.querySelector('[class*="qr-code"], [data-e2e="qr-code"]');
             if (qrContainer) {
                 const dataUrl = qrContainer.getAttribute('data-login-url') || qrContainer.getAttribute('data-url');
                 if (dataUrl) return dataUrl;
             }
 
-            // Fallback: return current page URL if it has token
             const currentUrl = window.location.href;
             if (currentUrl.includes('webcast') || currentUrl.includes('login')) {
                 return currentUrl;
@@ -348,13 +415,12 @@ async function doQRLogin(page) {
     }
 }
 
-async function waitForQRScan(page, timeoutMs = 120000) {
+async function waitForQRScan(pg, timeoutMs = 120000) {
     const startTime = Date.now();
 
     while (Date.now() - startTime < timeoutMs) {
         try {
-            // Check if user is now logged in (redirected from login page)
-            const isLoggedIn = await checkTikTokSession(page);
+            const isLoggedIn = await checkTikTokSession(pg);
             if (isLoggedIn) {
                 return true;
             }
@@ -366,217 +432,251 @@ async function waitForQRScan(page, timeoutMs = 120000) {
     return false; // Timeout
 }
 
-// ================= API MODE =================
+// ═══════════════════════════════════════════════════════════════════
+//  API POLLING LOOP — HARDENED (ONE-TRY RULE)
+// ═══════════════════════════════════════════════════════════════════
 
-setInterval(async()=>{
+// ═══ Persistent file-based processed-IDs list ═══
+// Survives process restarts: even after a kill/reboot cycle,
+// already-charged order IDs are never charged again.
+const PROCESSED_IDS_FILE = path.join(__dirname, 'processed_orders.json');
 
-    if(isRunning) return;
-
-    const order=await worker.getPendingOrder();
-
-    if(!order) return;
-
-    // ═══ Skip already-processed orders (prevent re-processing) ═══
-    if(processedOrderIds.has(order.order_id)){
-        log('⏭️  Skipping already-processed order: ' + order.order_id);
-        await worker.failOrder(order, 'already_processed_skip');
-        return;
-    }
-
-    // ═══ Claim order immediately — prevent other instances from pulling it ═══
+function loadProcessedIds() {
     try {
-        await worker.updateOrder(order, { status: 'processing' });
+        if (fs.existsSync(PROCESSED_IDS_FILE)) {
+            const ids = JSON.parse(fs.readFileSync(PROCESSED_IDS_FILE, 'utf8'));
+            return new Set(Array.isArray(ids) ? ids : []);
+        }
+    } catch {}
+    return new Set();
+}
+
+let persistedProcessedIds = loadProcessedIds();
+
+function saveProcessedIds() {
+    try {
+        fs.writeFileSync(PROCESSED_IDS_FILE, JSON.stringify([...persistedProcessedIds]));
+    } catch (e) {
+        warn('Could not save processed IDs: ' + e.message);
+    }
+}
+
+setInterval(async () => {
+    // ── Shutdown guard ──
+    if (shutdownRequested) return;
+
+    // ── In-process lock (no overlapping ticks) ──
+    if (isRunning) return;
+
+    try {
+        const order = await worker.getPendingOrder();
+        if (!order) return;
+
+        // ═══ Rule #1: NEVER re-process an order we've already attempted ═══
+        if (persistedProcessedIds.has(order.order_id)) {
+            log('⏭️  Order already attempted before — skipping forever: ' + order.order_id);
+            // Force it to "failed" so the website never offers it again
+            await worker.failOrder(order, 'already_attempted_skip');
+            return;
+        }
+
+        // ═══ Rule #2: Atomic claim — other instances can't grab it ═══
+        const claimed = await worker.updateOrder(order, { status: 'processing' });
+        if (!claimed) {
+            warn('Could not claim order (backend unreachable) — will retry next tick: ' + order.order_id);
+            return;
+        }
         log('🔒 Order claimed: ' + order.order_id + ' → processing');
-    } catch (e) {
-        warn('Could not claim order: ' + e.message);
-    }
 
-    // ═══ Mark as processed so we never re-process it ═══
-    processedOrderIds.add(order.order_id);
+        // ═══ Mark as attempted — irreversible for this process lifetime ═══
+        persistedProcessedIds.add(order.order_id);
+        saveProcessedIds();
 
-    global.CURRENT_ORDER = order;
+        global.CURRENT_ORDER = order;
+        isRunning = true;
 
-    isRunning=true;
+        console.log("📦 Processing:", order.order_id);
 
-    console.log("📦 Processing:",order.order_id);
+        // ═══ Session check ─══
+        let sessionValid = false;
+        try {
+            sessionValid = await checkTikTokSession(page);
+        } catch (e) {
+            warn('Session check failed: ' + e.message);
+        }
 
-    // ═══ Check if session is still valid
-    let sessionValid = false;
-    try {
-        sessionValid = await checkTikTokSession(page);
-    } catch (e) {
-        warn('Session check failed: ' + e.message);
-    }
+        if (!sessionValid) {
+            log('⚠️ TikTok session expired — need QR login');
 
-    if (!sessionValid) {
-        log('⚠️ TikTok session expired — need QR login');
-        
-        // Try QR login
-        const qrResult = await doQRLogin(page);
-        
-        if (qrResult.success && qrResult.link) {
-            // Send login link to website
-            await worker.sendLoginLink(order, qrResult.link);
-            log('📤 Login link sent to website');
-            
-            // Wait for user to scan QR (up to 2 minutes)
-            log('⏳ Waiting for user to scan QR...');
-            const scanned = await waitForQRScan(page, 120000);
-            
-            if (!scanned) {
-                warn('QR scan timeout — order will be retried later');
+            const qrResult = await doQRLogin(page);
+
+            if (qrResult.success && qrResult.link) {
+                await worker.sendLoginLink(order, qrResult.link);
+                log('📤 Login link sent to website');
+
+                log('⏳ Waiting for user to scan QR (max 2 min)...');
+                const scanned = await waitForQRScan(page, 120000);
+
+                if (!scanned) {
+                    // ═══ ONE-TRY RULE: user did not scan → fail, NO retry ═══
+                    warn('QR scan timeout — order FAILED (user must re-confirm)');
+                    await worker.failOrder(order, 'qr_scan_timeout_no_retry');
+                    isRunning = false;
+                    return;
+                }
+
+                log('✅ User scanned QR — session active');
+                try { await context.storageState({ path: SESSION_FILE }); } catch {}
+            } else {
+                // QR extraction failed → fail, no retry
+                warn('QR login failed: ' + (qrResult.error || 'unknown'));
+                await worker.failOrder(order, 'qr_login_failed');
                 isRunning = false;
                 return;
             }
-            
-            log('✅ User scanned QR — session active');
-            
-            // Save session
-            try { await context.storageState({ path: SESSION_FILE }); } catch {}
         } else {
-            warn('QR login failed: ' + (qrResult.error || 'unknown'));
-            await worker.failOrder(order, 'qr_login_failed');
-            isRunning = false;
-            return;
+            log('✅ TikTok session is valid');
         }
-    } else {
-        log('✅ TikTok session is valid');
-    }
 
-    try{
+        // ═══ Payment sequence — ANY step failure halts immediately ═══
+        try {
+            const result = await runFullSequence({
+                page,
+                CONFIG,
+                CARD_FILE,
+                sleep,
+                log,
+                warn,
+                err,
+                takeScreenshot: async (stepName) => {
+                    const srcFile = path.join(SCREENSHOT_DIR, `${stepName}.png`);
+                    const publicFile = path.join(PUBLIC_DIR, `${stepName}.png`);
 
-        const result = await runFullSequence({
-            page,
-            CONFIG,
-            CARD_FILE,
-            sleep,
-            log,
-            warn,
-            err,
-            takeScreenshot: async (stepName) => {
-                const srcFile = path.join(SCREENSHOT_DIR, `${stepName}.png`);
-                const publicFile = path.join(PUBLIC_DIR, `${stepName}.png`);
-
-                try {
-                    const buffer = await page.screenshot({ type: 'png' });
-                    fs.writeFileSync(srcFile, buffer);
-                    fs.copyFileSync(srcFile, publicFile);
-                    log(`📸 ${stepName}.png saved (${buffer.length} bytes)`);
-                    return true;
-                } catch (e) {
-                    err(`Screenshot ${stepName}`, e);
-                    return false;
-                }
-            },
-            clickOne: async (selectors, label) => {
-                for (const sel of selectors) {
                     try {
-                        const el = page.locator(sel).first();
-
-                        if (await el.isVisible({ timeout: 6000 })) {
-                            await el.click({ force: true });
-                            log(`   ✅ Clicked: ${label}`);
-                            return true;
-                        }
-                    } catch {}
-                }
-
-                warn(`Could not click: ${label}`);
-                return false;
-            },
-            fillInIframe: async (iframeLocator, placeholder, value, label) => {
-                const selectors = [
-                    `input[placeholder="${placeholder}"]`,
-                    `input[placeholder*="${placeholder.split(' ').slice(0, 2).join(' ')}" i]`,
-                    `input[placeholder*="${placeholder}" i]`,
-                    `input[name*="${placeholder.split(' ')[0]}" i]`,
-                ];
-
-                for (const sel of selectors) {
-                    try {
-                        const el = iframeLocator.locator(sel).first();
-
-                        if (await el.isVisible({ timeout: 5000 })) {
-                            await el.click({ force: true });
-                            await sleep(300);
-                            await el.fill('');
-                            await sleep(100);
-                            await el.type(value, { delay: 60 });
-
-                            log(`   ✅ Filled iframe field: ${label}`);
-                            return true;
-                        }
-                    } catch {}
-                }
-
-                warn(`Could not fill iframe field: ${label}`);
-                return false;
-            },
-            dumpIframe: async () => {
-                try {
-                    const iframe = page
-                        .frameLocator('iframe[src*="pipopay"]')
-                        .first();
-
-                    const info = await iframe.evaluate(() => ({
-                        inputs: Array.from(document.querySelectorAll('input')).map(inp => ({
-                            placeholder: inp.placeholder,
-                            name: inp.name,
-                            type: inp.type,
-                            visible: inp.getBoundingClientRect().height > 0
-                        })),
-                        buttons: Array.from(
-                            document.querySelectorAll('button, [role="button"]')
-                        ).map(btn => ({
-                            text: (btn.textContent || '').trim().substring(0, 50)
-                        })),
-                        bodyPreview: document.body.innerText.substring(0, 300)
-                    }));
-
-                    log('   📍 INSIDE PipoPay iframe:');
-                    log('   📍 Body preview: ' + info.bodyPreview);
-
-                    info.inputs.forEach((inp, i) =>
-                        log(`      Input ${i + 1}: ph="${inp.placeholder}" name="${inp.name}" type="${inp.type}"`)
-                    );
-
-                    info.buttons.forEach((btn, i) =>
-                        log(`      Button ${i + 1}: "${btn.text}"`)
-                    );
-
-                } catch (e) {
-                    warn('Could not access iframe contents: ' + e.message);
-                }
-            },
-            getState: () => ({
-                setStep: (step) => {
-                    currentStep = step;
+                        const buffer = await page.screenshot({ type: 'png' });
+                        fs.writeFileSync(srcFile, buffer);
+                        fs.copyFileSync(srcFile, publicFile);
+                        log(`📸 ${stepName}.png saved (${buffer.length} bytes)`);
+                        return true;
+                    } catch (e) {
+                        err(`Screenshot ${stepName}`, e);
+                        return false;
+                    }
                 },
-                setProgress: (message) => {
-                    progressMsg = message;
-                }
-            })
-        });
+                clickOne: async (selectors, label) => {
+                    for (const sel of selectors) {
+                        try {
+                            const el = page.locator(sel).first();
 
-        if (!result?.success) {
-            await worker.failOrder(order, result?.message || "Payment sequence failed");
-        } else {
-            await worker.completeOrder(order);
+                            if (await el.isVisible({ timeout: 6000 })) {
+                                await el.click({ force: true });
+                                log(`   ✅ Clicked: ${label}`);
+                                return true;
+                            }
+                        } catch {}
+                    }
+
+                    warn(`Could not click: ${label}`);
+                    return false;
+                },
+                fillInIframe: async (iframeLocator, placeholder, value, label) => {
+                    const selectors = [
+                        `input[placeholder="${placeholder}"]`,
+                        `input[placeholder*="${placeholder.split(' ').slice(0, 2).join(' ')}" i]`,
+                        `input[placeholder*="${placeholder}" i]`,
+                        `input[name*="${placeholder.split(' ')[0]}" i]`,
+                    ];
+
+                    for (const sel of selectors) {
+                        try {
+                            const el = iframeLocator.locator(sel).first();
+
+                            if (await el.isVisible({ timeout: 5000 })) {
+                                await el.click({ force: true });
+                                await sleep(300);
+                                await el.fill('');
+                                await sleep(100);
+                                await el.type(value, { delay: 60 });
+
+                                log(`   ✅ Filled iframe field: ${label}`);
+                                return true;
+                            }
+                        } catch {}
+                    }
+
+                    warn(`Could not fill iframe field: ${label}`);
+                    return false;
+                },
+                dumpIframe: async () => {
+                    try {
+                        const iframe = page
+                            .frameLocator('iframe[src*="pipopay"]')
+                            .first();
+
+                        const info = await iframe.evaluate(() => ({
+                            inputs: Array.from(document.querySelectorAll('input')).map(inp => ({
+                                placeholder: inp.placeholder,
+                                name: inp.name,
+                                type: inp.type,
+                                visible: inp.getBoundingClientRect().height > 0
+                            })),
+                            buttons: Array.from(
+                                document.querySelectorAll('button, [role="button"]')
+                            ).map(btn => ({
+                                text: (btn.textContent || '').trim().substring(0, 50)
+                            })),
+                            bodyPreview: document.body.innerText.substring(0, 300)
+                        }));
+
+                        log('   📍 INSIDE PipoPay iframe:');
+                        log('   📍 Body preview: ' + info.bodyPreview);
+
+                        info.inputs.forEach((inp, i) =>
+                            log(`      Input ${i + 1}: ph="${inp.placeholder}" name="${inp.name}" type="${inp.type}"`)
+                        );
+
+                        info.buttons.forEach((btn, i) =>
+                            log(`      Button ${i + 1}: "${btn.text}"`)
+                        );
+
+                    } catch (e) {
+                        warn('Could not access iframe contents: ' + e.message);
+                    }
+                },
+                getState: () => ({
+                    setStep: (step) => {
+                        currentStep = step;
+                    },
+                    setProgress: (message) => {
+                        progressMsg = message;
+                    }
+                })
+            });
+
+            // ═══ Final verdict — ONE attempt only ═══
+            if (!result?.success) {
+                warn('Payment sequence failed — order marked FAILED (no retry)');
+                await worker.failOrder(order, result?.message || 'payment_sequence_failed');
+            } else {
+                log('✅ Payment sequence completed — order marked COMPLETED');
+                await worker.completeOrder(order);
+            }
+
+        } catch (e) {
+            console.log(e);
+            warn('Unexpected crash — order marked FAILED (no retry)');
+            await worker.failOrder(order, String(e));
         }
 
-    }catch(e){
+        isRunning = false;
 
-        console.log(e);
-
-        await worker.failOrder(order, String(e));
-
+    } catch (loopError) {
+        err('Polling loop error', loopError);
+        isRunning = false;
     }
 
-    isRunning=false;
+}, CONFIG.POLL_INTERVAL);
 
-},CONFIG.POLL_INTERVAL);
-
-// ================= END API MODE =================
-
-
-login();
+// ═══ Start with PID lock guard ═══
+acquireLock();
+launchBrowser();

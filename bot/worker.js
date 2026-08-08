@@ -66,13 +66,26 @@ async function claimOrder(order) {
         return false;
     }
 
+    // ═══ Atomic backend claim: mark order as "processing" so no
+    // other bot instance can ever pull it again ═══
+    const claimed = await api.updateOrder(order, {
+        status: "processing"
+    });
+
+    if (!claimed) {
+        utils.error(
+            `Could not atomically claim order ${order.order_id}`
+        );
+        return false;
+    }
+
     running = true;
     currentOrder = order;
 
     global.CURRENT_ORDER = order;
 
     utils.log(
-        `📦 Order claimed: ${order.order_id}`
+        `📦 Order claimed: ${order.order_id} → processing`
     );
 
     return true;
@@ -90,10 +103,17 @@ async function failOrder(errorMessage) {
         return;
     }
 
+    const orderId = currentOrder.order_id;
+
     await updateOrder({
         status: "failed",
-        error: errorMessage
+        charge_status: "failed",
+        session_id: errorMessage
     });
+
+    utils.log(
+        `❌ Order ${orderId} marked as FAILED: ${errorMessage}`
+    );
 
     releaseOrder();
 }
@@ -103,10 +123,17 @@ async function completeOrder(extraData = {}) {
         return;
     }
 
+    const orderId = currentOrder.order_id;
+
     await updateOrder({
         status: "completed",
+        charge_status: "completed",
         ...extraData
     });
+
+    utils.log(
+        `✅ Order ${orderId} marked as COMPLETED`
+    );
 
     releaseOrder();
 }
