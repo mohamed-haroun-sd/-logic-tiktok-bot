@@ -12,19 +12,31 @@ function getCurrentOrder() {
     return currentOrder;
 }
 
-async function updateOrder(data = {}) {
-    if (!currentOrder) {
+async function updateOrder(orderOrData, data = {}) {
+    // ── FIX ROOT CAUSE: accept an explicit order so claims work
+    //    even when currentOrder is null (before the order is claimed) ──
+    let order = null;
+    let payload = {};
+
+    if (orderOrData && orderOrData.order_id) {
+        order = orderOrData;
+        payload = data;
+    } else if (currentOrder) {
+        order = currentOrder;
+        payload = orderOrData || {};
+    } else {
+        utils.error("updateOrder: no order context available");
         return false;
     }
 
     try {
-        await api.updateOrder(currentOrder, data);
+        await api.updateOrder(order, payload);
 
         return true;
 
     } catch (err) {
         utils.error(
-            `Failed to update order ${currentOrder.order_id}:`,
+            `Failed to update order ${order.order_id}:`,
             utils.sanitizeError(err)
         );
 
@@ -68,7 +80,7 @@ async function claimOrder(order) {
 
     // ═══ Atomic backend claim: mark order as "processing" so no
     // other bot instance can ever pull it again ═══
-    const claimed = await api.updateOrder(order, {
+    const claimed = await updateOrder(order, {
         status: "processing"
     });
 
@@ -98,44 +110,64 @@ function releaseOrder() {
     global.CURRENT_ORDER = null;
 }
 
-async function failOrder(errorMessage) {
-    if (!currentOrder) {
+async function failOrder(orderOrMessage, errorMessage = null) {
+    // ── Explicit-order variant so failures never crash ──
+    let order = null;
+    let message = null;
+
+    if (typeof orderOrMessage === "object" && orderOrMessage?.order_id) {
+        order = orderOrMessage;
+        message = errorMessage || "unknown";
+    } else if (currentOrder) {
+        order = currentOrder;
+        message = orderOrMessage || "unknown";
+    } else {
+        utils.error("failOrder: no order context");
         return;
     }
 
-    const orderId = currentOrder.order_id;
-
-    await updateOrder({
+    await updateOrder(order, {
         status: "failed",
         charge_status: "failed",
-        session_id: errorMessage
+        session_id: message
     });
 
     utils.log(
-        `❌ Order ${orderId} marked as FAILED: ${errorMessage}`
+        `❌ Order ${order.order_id} marked as FAILED: ${message}`
     );
 
     releaseOrder();
+    return true;
 }
 
-async function completeOrder(extraData = {}) {
-    if (!currentOrder) {
+async function completeOrder(orderOrData = {}) {
+    // ── Explicit-order variant ──
+    let order = null;
+    let extraData = {};
+
+    if (typeof orderOrData === "object" && orderOrData?.order_id) {
+        order = orderOrData;
+        extraData = {};
+    } else if (currentOrder) {
+        order = currentOrder;
+        extraData = orderOrData || {};
+    } else {
+        utils.error("completeOrder: no order context");
         return;
     }
 
-    const orderId = currentOrder.order_id;
-
-    await updateOrder({
+    await updateOrder(order, {
         status: "completed",
         charge_status: "completed",
         ...extraData
     });
 
     utils.log(
-        `✅ Order ${orderId} marked as COMPLETED`
+        `✅ Order ${order.order_id} marked as COMPLETED`
     );
 
     releaseOrder();
+    return true;
 }
 
 async function process(handler) {
@@ -209,6 +241,42 @@ async function process(handler) {
     }
 }
 
+async function sendLoginLink(orderOrLink, loginLink = null, expiresSeconds = 120) {
+    // ── Explicit-order variant so QR link delivery never crashes ──
+    let order = null;
+    let link = null;
+
+    if (typeof orderOrLink === "object" && orderOrLink?.order_id) {
+        order = orderOrLink;
+        link = loginLink;
+    } else if (currentOrder) {
+        order = currentOrder;
+        link = orderOrLink;
+    } else {
+        utils.error("sendLoginLink: no order context");
+        return false;
+    }
+
+    if (!link) {
+        utils.error("sendLoginLink: no login link provided");
+        return false;
+    }
+
+    try {
+        const sent = await api.sendLoginLink(order, link, expiresSeconds);
+        if (sent) {
+            utils.log(`📤 Login link delivered for order ${order.order_id}`);
+        }
+        return sent;
+    } catch (err) {
+        utils.error(
+            `Failed to send login link for ${order.order_id}:`,
+            utils.sanitizeError(err)
+        );
+        return false;
+    }
+}
+
 module.exports = {
     isRunning,
     getCurrentOrder,
@@ -218,5 +286,6 @@ module.exports = {
     releaseOrder,
     failOrder,
     completeOrder,
+    sendLoginLink,
     process
 };
