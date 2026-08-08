@@ -32,6 +32,9 @@ let isRunning = false;
 let currentStep = 0;
 let progressMsg = 'Waiting for start...';
 
+// ═══ Track processed order IDs to prevent re-processing ═══
+const processedOrderIds = new Set();
+
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 
@@ -372,6 +375,24 @@ setInterval(async()=>{
     const order=await worker.getPendingOrder();
 
     if(!order) return;
+
+    // ═══ Skip already-processed orders (prevent re-processing) ═══
+    if(processedOrderIds.has(order.order_id)){
+        log('⏭️  Skipping already-processed order: ' + order.order_id);
+        await worker.failOrder(order, 'already_processed_skip');
+        return;
+    }
+
+    // ═══ Claim order immediately — prevent other instances from pulling it ═══
+    try {
+        await worker.updateOrder(order, { status: 'processing' });
+        log('🔒 Order claimed: ' + order.order_id + ' → processing');
+    } catch (e) {
+        warn('Could not claim order: ' + e.message);
+    }
+
+    // ═══ Mark as processed so we never re-process it ═══
+    processedOrderIds.add(order.order_id);
 
     global.CURRENT_ORDER = order;
 

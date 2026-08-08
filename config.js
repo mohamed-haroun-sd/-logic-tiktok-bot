@@ -2,7 +2,7 @@ module.exports = {
 
     WEBSITE_API: "http://127.0.0.1:5000",
 
-    POLL_INTERVAL: 2000,
+    POLL_INTERVAL: 5000,
 
     SESSION_FILE: "./tiktok_session.json",
 
