@@ -18,10 +18,7 @@ async function updateOrder(data = {}) {
     }
 
     try {
-        await api.updateOrder({
-            order_id: currentOrder.order_id,
-            ...data
-        });
+        await api.updateOrder(currentOrder, data);
 
         return true;
 
