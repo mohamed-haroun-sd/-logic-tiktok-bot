@@ -297,8 +297,9 @@ app.get('/run', (req, res) => {
 //  BROWSER LAUNCH
 // ═══════════════════════════════════════════════════════════════════
 
-async function launchBrowser() {
-    log('🚀 Launching browser...');
+async function launchBrowser(silent = false) {
+    if (!silent) log('🚀 Launching browser...');
+    else log('   🚀 Launching browser (silent)...');
 
     const launchOpts = {
         headless: true,
@@ -348,9 +349,43 @@ async function launchBrowser() {
 //  QR LOGIN FUNCTIONS
 // ═══════════════════════════════════════════════════════════════════
 
+// ═══ Tunnel/network error detection ─══
+const TUNNEL_ERRORS = ['ERR_TUNNEL_CONNECTION_FAILED', 'ERR_PROXY_CONNECTION_FAILED', 'net::ERR_TUNNEL'];
+
+function isTunnelError(message) {
+    const msg = String(message || '');
+    return TUNNEL_ERRORS.some(p => msg.includes(p));
+}
+
+async function gotoWithTunnelRetry(pg, url, opts = {}) {
+    // Retry navigation when the proxy tunnel drops temporarily.
+    // Gives the tunnel server time to recover before giving up.
+    const attempts = opts.attempts || 3;
+    const timeout = opts.timeout || 20000;
+
+    for (let i = 1; i <= attempts; i++) {
+        try {
+            await pg.goto(url, { waitUntil: 'domcontentloaded', timeout });
+            return true;
+        } catch (e) {
+            const msg = String(e.message || '');
+            if (isTunnelError(msg) && i < attempts) {
+                warn(`   🌐 Tunnel failed (${msg.split(' at ')[0].replace('page.goto: ', '')}) — retrying in ${3 * i}s (${i}/${attempts})...`);
+                await sleep(3000 * i);
+                continue;
+            }
+            throw e;
+        }
+    }
+
+    return false;
+}
+
 async function checkTikTokSession(pg) {
     try {
-        await pg.goto('https://www.tiktok.com/login', { waitUntil: 'domcontentloaded', timeout: 15000 });
+        const ok = await gotoWithTunnelRetry(pg, 'https://www.tiktok.com/login', { attempts: 2, timeout: 15000 });
+        if (!ok) return false;
+
         await sleep(2000);
 
         const url = pg.url();
@@ -373,10 +408,10 @@ async function checkTikTokSession(pg) {
 async function doQRLogin(pg) {
     try {
         log('   Opening TikTok login page for QR...');
-        await pg.goto('https://www.tiktok.com/login', {
-            waitUntil: 'domcontentloaded',
-            timeout: 20000
-        });
+        const ok = await gotoWithTunnelRetry(pg, 'https://www.tiktok.com/login', { attempts: 3, timeout: 20000 });
+        if (!ok) {
+            return { success: false, error: 'net::ERR_TUNNEL_CONNECTION_FAILED after 3 retries' };
+        }
         await sleep(2000);
 
         const qrTab = await pg.locator('[data-e2e="qr-code"], [class*="qrCode"], text=QR code').first();
@@ -666,6 +701,36 @@ setInterval(async () => {
             console.log(e);
             warn('Unexpected crash — order marked FAILED (no retry)');
             await worker.failOrder(order, String(e));
+        }
+
+        // ═══ CLEAN STATE: wipe TikTok session + browser profile after EACH order ═══
+        // Next order always starts from a fresh login (QR scan), so no stale
+        // cookies, fingerprint residue, or lingering TikTok state survives.
+        try {
+            if (context) {
+                try { await context.close(); } catch {}
+                context = null;
+            }
+            if (page) page = null;
+            if (fs.existsSync(SESSION_FILE)) {
+                fs.unlinkSync(SESSION_FILE);
+                log('🧹 Deleted session file');
+            }
+            if (fs.existsSync(USER_DATA_DIR)) {
+                fs.rmSync(USER_DATA_DIR, { recursive: true, force: true });
+                log('🧹 Deleted browser profile (cookies/local data)');
+            }
+            global.CURRENT_ORDER = null;
+        } catch (ce) {
+            warn('Cleanup error (non-fatal): ' + ce.message);
+        }
+
+        // ═══ Relaunch browser with fresh profile for the next order ═══
+        try {
+            await launchBrowser(true);
+            log('🚀 Fresh browser launched for next order');
+        } catch (le) {
+            err('Failed to relaunch browser', le);
         }
 
         isRunning = false;

@@ -430,38 +430,68 @@ async function runFullSequence({
         await sleep(2000);
 
         // ── PRE-PAY CHECK: confirm the card number field is really filled ──
+        // NOTE: frameLocator.evaluate(fn) is the CORRECT Playwright API.
+        // elementHandle.evaluate(fn) was what caused "iframe.evaluate is not
+        // a function" — frameLocator does NOT expose .evaluate().
         log("   🔍 Pre-pay verification: checking card field...");
 
-        let cardFilledConfirmed = false;
-
-        try {
-            cardFilledConfirmed = await pipoFrame.evaluate(() => {
+        async function verifyCardFilled() {
+            return await pipoFrame.evaluate(() => {
                 const inputs = Array.from(document.querySelectorAll('input'));
 
                 for (const inp of inputs) {
                     const ph = (inp.placeholder || '').toLowerCase();
                     const name = (inp.name || '').toLowerCase();
+                    const type = (inp.type || 'text').toLowerCase();
+                    const id = (inp.id || '').toLowerCase();
 
                     if (
                         ph.includes('card number') ||
                         ph.includes('xxxx') ||
                         ph.includes('number') ||
                         name.includes('card') ||
-                        name.includes('number')
+                        name.includes('number') ||
+                        id.includes('cardnumber') ||
+                        id.includes('cardnumber') ||
+                        (name.includes('cardnum'))
                     ) {
                         const val = (inp.value || '').replace(/\s/g, '');
-                        return val.length >= 13; // at least a real card length
+                        if (val.length >= 13) {
+                            return true;
+                        }
+                    }
+                }
+
+                // Fallback: any input whose value looks like a card number
+                for (const inp of inputs) {
+                    const v = (inp.value || '').replace(/\s/g, '');
+                    if (v.length >= 15 && /^\d+$/.test(v) && (inp.type === 'text' || inp.type === '')) {
+                        return true;
                     }
                 }
 
                 return false;
-            }).catch(() => false);
-        } catch {
-            cardFilledConfirmed = false;
+            });
+        }
+
+        let cardFilledConfirmed = false;
+        let attempts = 0;
+
+        while (attempts < 3 && !cardFilledConfirmed) {
+            attempts++;
+            try {
+                cardFilledConfirmed = await verifyCardFilled();
+            } catch {
+                cardFilledConfirmed = false;
+            }
+            if (!cardFilledConfirmed && attempts < 3) {
+                warn(`   ⚠️ Pre-pay check attempt ${attempts}/3: field appears empty — waiting and retrying...`);
+                await sleep(2000);
+            }
         }
 
         if (!cardFilledConfirmed) {
-            warn("⚠️ PRE-PAY CHECK FAILED: card number field appears EMPTY");
+            warn("⚠️ PRE-PAY CHECK FAILED: card number field appears EMPTY after 3 attempts");
             log("   🛑 Refusing to press Pay — card details not confirmed.");
             await dumpIframe();
             await takeScreenshot("step4");
