@@ -178,13 +178,19 @@ async function runFullSequence({
         log(`   ✅ Exact package found: ${selectedPackage.amount} Coins (${selectedPrice || "price not shown"})`);
 
         // ── Click the matching package (by role + text, not nth-child) ──
-        const coinClicked = await clickOne(
-            [
-                `button:has-text("${selectedPackage.amount.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ",")}")`,
-                `button:has-text("${coinAmount}")`
-            ],
-            `${coinAmount} Coins`
-        );
+        // ── v13: Use stable data-e2e selectors for coin packages ──
+        const coinClicked = await page.click(`[data-e2e="wallet-package-coin-num-${coinAmount}"], button:has-text("${coinAmount}")`).then(() => true).catch(() => false);
+        
+        if (!coinClicked) {
+            log(`   ⚠️ Direct e2e click failed, trying generic search for ${coinAmount}...`);
+            await clickOne(
+                [
+                    `button:has-text("${selectedPackage.amount.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ",")}")`,
+                    `button:has-text("${coinAmount}")`
+                ],
+                `${coinAmount} Coins`
+            );
+        }
 
         if (!coinClicked) {
             await takeScreenshot("step1");
@@ -244,12 +250,8 @@ async function runFullSequence({
             await sleep(2000);
         }
 
-        const rechargeBtns = [
-            'button:has-text("Recharge")',
-            'button.TUXButton--primary:has-text("Recharge")'
-        ];
-
-        const clicked = await clickOne(rechargeBtns, "Recharge");
+        // ── v13: Use stable data-e2e selector for Recharge button ──
+        const clicked = await page.click('[data-e2e="wallet-buy-now-button"], button:has-text("Recharge")').then(() => true).catch(() => false);
 
         if (!clicked) {
             await takeScreenshot("step2");
