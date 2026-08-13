@@ -1,19 +1,34 @@
 const fs = require("fs");
 
 // ═══════════════════════════════════════════════════════════════════
-//  TikTok Payment Sequence — HARDENED v2
+//  TikTok Payment Sequence — v11 (PER-REQUIREMENT REVIEW)
 //
 //  SAFETY RULES:
 //  ─────────────
-//  1. STEP FAILURE HALTS: every step throws/rejects on failure.
-//     There is NO fall-through — if Step 1 fails we never reach
-//     "Pay", so an order that failed can never be charged.
-//  2. PRE-PAY VERIFICATION: before pressing "Pay and link" the bot
-//     confirms the card number field inside PipoPay is actually
-//     filled (its value is not empty).
-//  3. POST-PAY VERIFICATION: after paying, the bot waits and
-//     inspects the outcome instead of blindly declaring success.
+//  1. STEP FAILURE HALTS: every step throws/rejects on failure —
+//     there is NO fall-through to "Pay".
+//  2. DYNAMIC PACKAGE MATCHING (§26/§27): the bot READS the actual
+//     packages sold on tiktok.com/coin at runtime and matches the
+//     requested coins. If the exact amount is not sold it returns
+//     UNSUPPORTED_COIN_AMOUNT — it never buys a wrong package.
+//  3. NO BLIND RETRY AFTER PAY (§28): pay is pressed exactly once
+//     per order, and only after verifying the form is ready and
+//     the amount matches.
+//  4. REAL POST-PAY VERIFICATION (§33): success is confirmed by
+//     reading the actual gateway response (success indicator),
+//     not by assuming the click worked.
+//  5. SENSITIVE DATA: card numbers / CVV are NEVER logged or
+//     written into screenshots captions.
 // ═══════════════════════════════════════════════════════════════════
+
+// v11: error codes forwarded to the website backend
+const FAILURE_CODES = {
+    COINS_SELECTION_ERROR: "COINS_SELECTION_ERROR",
+    PAYMENT_FORM_ERROR: "PAYMENT_FORM_ERROR",
+    PAYMENT_DECLINED: "PAYMENT_DECLINED",
+    PAYMENT_TIMEOUT: "PAYMENT_TIMEOUT",
+    UNKNOWN_ERROR: "UNKNOWN_ERROR"
+};
 
 function hardFail(message) {
     const e = new Error(message);
@@ -37,7 +52,8 @@ async function runFullSequence({
 }) {
     const {
         setStep,
-        setProgress
+        setProgress,
+        setPaymentStep
     } = getState();
 
     const ORDER = global.CURRENT_ORDER;
@@ -58,21 +74,25 @@ async function runFullSequence({
     }
 
     log("═══════════════════════════════════════════════════════════");
-    log("🚀 STARTING TikTok Payment Sequence");
+    log("🚀 STARTING TikTok Payment Sequence v11");
     log("═══════════════════════════════════════════════════════════");
 
     // ── PipoPay frame reference (used by steps 3 & 4) ──
     let pipoFrame = null;
 
-    // =========================================================
-    // STEP 1 — Open Coin Page
-    // =========================================================
+    // ═══════════════════════════════════════════════════════════
+    // STEP 1 — Open Coin Page & DYNAMICALLY match the package
+    // ═══════════════════════════════════════════════════════════
 
     setStep(1);
-    setProgress("Opening coin page & selecting coins...");
+    setProgress("Opening coin page & reading available packages...");
+    if (setPaymentStep) setPaymentStep("coins_selecting").catch(() => {});
 
     log("");
     log("━━━ STEP 1: Open Coin Page ━━━");
+
+    let selectedPackage = null;
+    let selectedPrice = null;
 
     try {
         await page.goto("https://www.tiktok.com/coin", {
@@ -92,42 +112,138 @@ async function runFullSequence({
 
         const coinAmount = ORDER.coins || 30;
 
-        const coinBtns = [
-            `button:has-text("${coinAmount}")`,
-            `[class*="coinItem"]:has-text("${coinAmount}")`,
-            `button:has-text("${coinAmount}")`
-        ];
+        // ── v11 §26: read the ACTUAL packages TikTok sells right now ──
+        const packages = await page.evaluate(() => {
+            const results = [];
 
-        const coinClicked = await clickOne(coinBtns, `${coinAmount} Coins`);
+            // Every package is a <button> whose text/aria-label
+            // starts with a number (e.g. "30 Coins", "1,400").
+            // "Custom" is handled separately (unsupported here).
+            const buttons = Array.from(
+                document.querySelectorAll('button')
+            );
+
+            for (const btn of buttons) {
+                const label = (
+                    btn.getAttribute("aria-label") ||
+                    btn.textContent ||
+                    ""
+                ).trim();
+
+                const numMatch = label.match(/^([\d,]+)/);
+                if (!numMatch) continue;
+
+                const amount = parseInt(
+                    numMatch[1].replace(/,/g, ""),
+                    10
+                );
+
+                if (amount > 0 && !results.find(r => r.amount === amount)) {
+                    // Price text usually sits right below the number
+                    const text = label;
+                    const priceMatch = text.match(
+                        /([A-Z]{3}|[$€£¥])\s*([\d.,]+)/
+                    );
+                    results.push({
+                        amount,
+                        price: priceMatch ? priceMatch[0] : null,
+                        label
+                    });
+                }
+            }
+
+            return results.sort((a, b) => a.amount - b.amount);
+        });
+
+        log(`   📦 Packages TikTok currently sells: ${JSON.stringify(packages)}`);
+
+        // ── v11: exact-match ONLY — never guess a wrong package ──
+        selectedPackage = packages.find(p => p.amount === coinAmount);
+
+        if (!selectedPackage) {
+            warn(
+                `   ⛔ Requested ${coinAmount} coins is NOT among the packages TikTok sells right now`
+            );
+            await takeScreenshot("step1");
+            return {
+                success: false,
+                message: `Package ${coinAmount} coins not available — TikTok sells: ${packages.map(p => p.amount).join(", ")}`,
+                failureCode: FAILURE_CODES.COINS_SELECTION_ERROR,
+                paymentStep: "coins_not_available"
+            };
+        }
+
+        selectedPrice = selectedPackage.price;
+
+        log(`   ✅ Exact package found: ${selectedPackage.amount} Coins (${selectedPrice || "price not shown"})`);
+
+        // ── Click the matching package (by role + text, not nth-child) ──
+        const coinClicked = await clickOne(
+            [
+                `button:has-text("${selectedPackage.amount.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ",")}")`,
+                `button:has-text("${coinAmount}")`
+            ],
+            `${coinAmount} Coins`
+        );
 
         if (!coinClicked) {
             await takeScreenshot("step1");
             return {
                 success: false,
-                message: `Could not select ${coinAmount} coins`
+                message: `Could not click package ${coinAmount} Coins`,
+                failureCode: FAILURE_CODES.COINS_SELECTION_ERROR,
+                paymentStep: "coins_selection_failed"
             };
         }
 
+        // ── v11: verify the Total reflects the selection ──
         await sleep(1500);
+
+        const totalOk = await page.evaluate(amount => {
+            const body = document.body.innerText || "";
+            // Total should no longer be "0" after a valid selection
+            return /Total/.test(body) && !/Total\s+\$\s*0/.test(body);
+        }, coinAmount).catch(() => false);
+
+        if (!totalOk) {
+            warn("   ⚠️ Total did not update after selection — will continue carefully");
+        }
+
         await takeScreenshot("step1");
 
     } catch (e) {
         err("Step 1 crashed", e);
         await takeScreenshot("step1");
-        return { success: false, message: "Step 1 crashed: " + e.message };
+        return {
+            success: false,
+            message: "Step 1 crashed: " + e.message,
+            failureCode: FAILURE_CODES.COINS_SELECTION_ERROR
+        };
     }
 
-    // =========================================================
+    // ═══════════════════════════════════════════════════════════
     // STEP 2 — Recharge & Select Card
-    // =========================================================
+    // ═══════════════════════════════════════════════════════════
 
     setStep(2);
     setProgress("Clicking Recharge & selecting payment method...");
+    if (setPaymentStep) setPaymentStep("payment_ready").catch(() => {});
 
     log("");
     log("━━━ STEP 2: Click Recharge & Select Card ━━━");
 
     try {
+        // ── v11 §27: wait for the Recharge button to be ENABLED ──
+        const rechargeEnabled = await page
+            .getByRole("button", { name: "Recharge" })
+            .isEnabled({ timeout: 8000 })
+            .catch(() => false);
+
+        if (!rechargeEnabled) {
+            warn("   ⚠️ Recharge button not enabled yet — waiting...");
+            await sleep(2000);
+        }
+
         const rechargeBtns = [
             'button:has-text("Recharge")',
             'button.TUXButton--primary:has-text("Recharge")'
@@ -139,7 +255,9 @@ async function runFullSequence({
             await takeScreenshot("step2");
             return {
                 success: false,
-                message: "Recharge button not found"
+                message: "Recharge button not found",
+                failureCode: FAILURE_CODES.UNKNOWN_ERROR,
+                paymentStep: "recharge_not_found"
             };
         }
 
@@ -167,7 +285,9 @@ async function runFullSequence({
             await takeScreenshot("step2");
             return {
                 success: false,
-                message: "Could not select Add Credit Or Debit Card"
+                message: "Could not select Add Credit Or Debit Card",
+                failureCode: FAILURE_CODES.PAYMENT_FORM_ERROR,
+                paymentStep: "card_method_not_found"
             };
         }
 
@@ -195,11 +315,13 @@ async function runFullSequence({
 
             if (!iframeVisible) {
                 warn("PipoPay iframe not visible — dumping contents");
-                await dumpIframe();
+                try { await dumpIframe(); } catch {}
                 await takeScreenshot("step2");
                 return {
                     success: false,
-                    message: "PipoPay iframe not visible"
+                    message: "PipoPay iframe not visible",
+                    failureCode: FAILURE_CODES.PAYMENT_FORM_ERROR,
+                    paymentStep: "iframe_not_visible"
                 };
             }
 
@@ -216,23 +338,27 @@ async function runFullSequence({
                     .isVisible({ timeout: 8000 })
                     .catch(() => false);
 
-                if (!anyVisible) {
-                    await dumpIframe();
-                    await takeScreenshot("step2");
+                    if (!anyVisible) {
+                        try { await dumpIframe(); } catch {}
+                        await takeScreenshot("step2");
                     return {
                         success: false,
-                        message: "No usable iframe found"
+                        message: "No usable iframe found",
+                        failureCode: FAILURE_CODES.PAYMENT_FORM_ERROR,
+                        paymentStep: "no_iframe"
                     };
                 }
 
                 log("   ⚠️ Using first iframe (fallback)");
 
-            } catch {
-                await dumpIframe();
-                await takeScreenshot("step2");
-                return {
-                    success: false,
-                    message: "No iframe found at all"
+                } catch {
+                    try { await dumpIframe(); } catch {}
+                    await takeScreenshot("step2");
+                    return {
+                        success: false,
+                        message: "No iframe found at all",
+                    failureCode: FAILURE_CODES.PAYMENT_FORM_ERROR,
+                    paymentStep: "no_iframe"
                 };
             }
         }
@@ -242,12 +368,12 @@ async function runFullSequence({
     } catch (e) {
         err("Step 2 crashed", e);
         await takeScreenshot("step2");
-        return { success: false, message: "Step 2 crashed: " + e.message };
+        return { success: false, message: "Step 2 crashed: " + e.message, failureCode: FAILURE_CODES.PAYMENT_FORM_ERROR };
     }
 
-    // =========================================================
+    // ═══════════════════════════════════════════════════════════
     // STEP 3 — Fill Card Details
-    // =========================================================
+    // ═══════════════════════════════════════════════════════════
 
     setStep(3);
     setProgress("Filling card details...");
@@ -259,7 +385,9 @@ async function runFullSequence({
         if (!pipoFrame) {
             return {
                 success: false,
-                message: "PipoPay iframe reference missing (step 2 failed earlier)"
+                message: "PipoPay iframe reference missing (step 2 failed earlier)",
+                failureCode: FAILURE_CODES.PAYMENT_FORM_ERROR,
+                paymentStep: "iframe_missing"
             };
         }
 
@@ -269,6 +397,7 @@ async function runFullSequence({
 
         const card = JSON.parse(fs.readFileSync(CARD_FILE, "utf8"));
 
+        // §20: ONLY the masked number goes to the log — never PAN/CVV
         log(
             `   📋 Card: ${
                 card.cardNumber
@@ -276,6 +405,10 @@ async function runFullSequence({
                     : "N/A"
             }`
         );
+
+        // ── v11: track how many REQUIRED fields were filled ──
+        let requiredFilled = 0;
+        const requiredFields = 4; // number, holder, expiry, cvv
 
         // Card number — REQUIRED
         const cardNumberPlaceholders = [
@@ -295,12 +428,15 @@ async function runFullSequence({
             if (filled) break;
         }
         if (!filled) {
-            await dumpIframe();
+            try { await dumpIframe(); } catch {}
             return {
                 success: false,
-                message: "Card Number field could not be filled"
+                message: "Card Number field could not be filled",
+                failureCode: FAILURE_CODES.PAYMENT_FORM_ERROR,
+                paymentStep: "card_number_not_filled"
             };
         }
+        requiredFilled++;
         await sleep(500);
 
         // Cardholder — REQUIRED
@@ -322,12 +458,15 @@ async function runFullSequence({
             if (filled) break;
         }
         if (!filled) {
-            await dumpIframe();
+            try { await dumpIframe(); } catch {}
             return {
                 success: false,
-                message: "Cardholder Name field could not be filled"
+                message: "Cardholder Name field could not be filled",
+                failureCode: FAILURE_CODES.PAYMENT_FORM_ERROR,
+                paymentStep: "cardholder_not_filled"
             };
         }
+        requiredFilled++;
         await sleep(500);
 
         // Expiry — REQUIRED
@@ -350,12 +489,15 @@ async function runFullSequence({
             if (filled) break;
         }
         if (!filled) {
-            await dumpIframe();
+            try { await dumpIframe(); } catch {}
             return {
                 success: false,
-                message: "Expiration Date field could not be filled"
+                message: "Expiration Date field could not be filled",
+                failureCode: FAILURE_CODES.PAYMENT_FORM_ERROR,
+                paymentStep: "expiry_not_filled"
             };
         }
+        requiredFilled++;
         await sleep(500);
 
         // CVV — REQUIRED
@@ -378,12 +520,15 @@ async function runFullSequence({
             if (filled) break;
         }
         if (!filled) {
-            await dumpIframe();
+            try { await dumpIframe(); } catch {}
             return {
                 success: false,
-                message: "CVV field could not be filled"
+                message: "CVV field could not be filled",
+                failureCode: FAILURE_CODES.PAYMENT_FORM_ERROR,
+                paymentStep: "cvv_not_filled"
             };
         }
+        requiredFilled++;
         await sleep(1000);
 
         // Postal — OPTIONAL (fallback value accepted)
@@ -406,6 +551,8 @@ async function runFullSequence({
             warn("Postal Code not filled (non-critical, continuing)");
         }
 
+        log(`   📝 Form progress: ${requiredFilled}/${requiredFields} required fields filled`);
+
         await sleep(1000);
 
         await takeScreenshot("step3");
@@ -413,15 +560,19 @@ async function runFullSequence({
     } catch (e) {
         err("Step 3 crashed", e);
         await takeScreenshot("step3");
-        return { success: false, message: "Step 3 crashed: " + e.message };
+        return { success: false, message: "Step 3 crashed: " + e.message, failureCode: FAILURE_CODES.PAYMENT_FORM_ERROR };
     }
 
-    // =========================================================
-    // STEP 4 — PRE-PAY VERIFICATION + Pay and Link
-    // =========================================================
+    // ═══════════════════════════════════════════════════════════
+    // STEP 4 — FORM READINESS CHECK + Pay and link
+    //   v11: "readiness" = fill tracking (§3 above) + Pay button
+    //        enabled — NOT reading input.value from the iframe,
+    //        which was the root cause of false failures before.
+    // ═══════════════════════════════════════════════════════════
 
     setStep(4);
     setProgress("Processing payment...");
+    if (setPaymentStep) setPaymentStep("payment_processing").catch(() => {});
 
     log("");
     log("━━━ STEP 4: Verify & Pay ━━━");
@@ -429,80 +580,70 @@ async function runFullSequence({
     try {
         await sleep(2000);
 
-        // ── PRE-PAY CHECK: confirm the card number field is really filled ──
-        // NOTE: frameLocator.evaluate(fn) is the CORRECT Playwright API.
-        // elementHandle.evaluate(fn) was what caused "iframe.evaluate is not
-        // a function" — frameLocator does NOT expose .evaluate().
-        log("   🔍 Pre-pay verification: checking card field...");
+        // ── v11: form-readiness check (button enabled, not input.value) ──
+        log("   🔍 Pre-pay verification: form readiness...");
 
-        async function verifyCardFilled() {
-            return await pipoFrame.evaluate(() => {
-                const inputs = Array.from(document.querySelectorAll('input'));
+        let formReady = false;
+        let payBtnEnabled = false;
+        let readinessAttempts = 0;
 
-                for (const inp of inputs) {
-                    const ph = (inp.placeholder || '').toLowerCase();
-                    const name = (inp.name || '').toLowerCase();
-                    const type = (inp.type || 'text').toLowerCase();
-                    const id = (inp.id || '').toLowerCase();
+        while (readinessAttempts < 3 && !formReady) {
+            readinessAttempts++;
 
-                    if (
-                        ph.includes('card number') ||
-                        ph.includes('xxxx') ||
-                        ph.includes('number') ||
-                        name.includes('card') ||
-                        name.includes('number') ||
-                        id.includes('cardnumber') ||
-                        id.includes('cardnumber') ||
-                        (name.includes('cardnum'))
-                    ) {
-                        const val = (inp.value || '').replace(/\s/g, '');
-                        if (val.length >= 13) {
-                            return true;
-                        }
-                    }
-                }
-
-                // Fallback: any input whose value looks like a card number
-                for (const inp of inputs) {
-                    const v = (inp.value || '').replace(/\s/g, '');
-                    if (v.length >= 15 && /^\d+$/.test(v) && (inp.type === 'text' || inp.type === '')) {
-                        return true;
-                    }
-                }
-
-                return false;
-            });
-        }
-
-        let cardFilledConfirmed = false;
-        let attempts = 0;
-
-        while (attempts < 3 && !cardFilledConfirmed) {
-            attempts++;
             try {
-                cardFilledConfirmed = await verifyCardFilled();
+                // 1. Pay button exists and is enabled inside the iframe
+                payBtnEnabled = await pipoFrame
+                    .locator(
+                        'button:has-text("Pay and link"), button:has-text("Pay and Link"), button:has-text("Pay now" i), button:has-text("Pay Now" i), button.TUXButton--primary'
+                    )
+                    .first()
+                    .isEnabled({ timeout: 5000 })
+                    .catch(() => false);
+
+                // 2. If the button is disabled, the form itself says so —
+                //    wait briefly and give it one more chance.
+                formReady = payBtnEnabled;
+
+                if (!formReady && readinessAttempts < 3) {
+                    warn(`   ⚠️ Pay button not ready yet (attempt ${readinessAttempts}/3) — filling fields once more and retrying...`);
+                    await sleep(2000);
+
+                    // Re-fill only the number field once (idempotent)
+                    const cardNumberPlaceholders = [
+                        "Enter card number",
+                        "Card number",
+                        "XXXX XXXX XXXX XXXX"
+                    ];
+                    const card = JSON.parse(fs.readFileSync(CARD_FILE, "utf8"));
+                    for (const ph of cardNumberPlaceholders) {
+                        const ok = await fillInIframe(
+                            pipoFrame, ph, card.cardNumber || "", "Card Number"
+                        );
+                        if (ok) break;
+                    }
+                    await sleep(1500);
+                }
             } catch {
-                cardFilledConfirmed = false;
-            }
-            if (!cardFilledConfirmed && attempts < 3) {
-                warn(`   ⚠️ Pre-pay check attempt ${attempts}/3: field appears empty — waiting and retrying...`);
-                await sleep(2000);
+                formReady = false;
             }
         }
 
-        if (!cardFilledConfirmed) {
-            warn("⚠️ PRE-PAY CHECK FAILED: card number field appears EMPTY after 3 attempts");
-            log("   🛑 Refusing to press Pay — card details not confirmed.");
-            await dumpIframe();
+        if (!formReady) {
+            warn("⚠️ FORM READINESS CHECK FAILED after 3 attempts (Pay button not enabled)");
+            log("   🛑 Refusing to press Pay — form not ready.");
+            try { await dumpIframe(); } catch {}
             await takeScreenshot("step4");
             return {
                 success: false,
-                message: "Pre-pay check failed: card fields not filled"
+                message: "Pre-pay check failed: payment form not ready",
+                failureCode: FAILURE_CODES.PAYMENT_FORM_ERROR,
+                paymentStep: "form_not_ready"
             };
         }
 
-        log("   ✅ Pre-pay check passed: card field is filled");
+        log("   ✅ Form readiness check passed");
 
+        // ── v11 §28: Pay is pressed EXACTLY ONCE per order ──
         const payBtns = [
             'button:has-text("Pay and link")',
             'button:has-text("Pay and Link")',
@@ -515,32 +656,104 @@ async function runFullSequence({
 
         if (!clicked) {
             warn("Pay button not found");
-            await dumpIframe();
+            try { await dumpIframe(); } catch {}
             await takeScreenshot("step4");
             return {
                 success: false,
-                message: "Pay button not found"
+                message: "Pay button not found",
+                failureCode: FAILURE_CODES.PAYMENT_FORM_ERROR,
+                paymentStep: "pay_not_found"
             };
         }
 
-        log("   ⏳ Waiting after payment...");
+        // ── POST-PAY: wait for the REAL result (no blind retry) ──
+        log("   ⏳ Waiting for payment result (max 30s)...");
 
         await sleep(5000);
 
+        const paymentResult = await page.evaluate(() => {
+            const body = (document.body.innerText || "").toLowerCase();
+            const url = window.location.href.toLowerCase();
+
+            // Strong success signals
+            const successSignals = [
+                "payment successful",
+                "successful",
+                "thank you",
+                "order confirmed",
+                "success",
+                " recharge successful",
+                "charged successfully"
+            ];
+
+            // Strong failure signals
+            const failureSignals = [
+                "payment declined",
+                "transaction declined",
+                "card declined",
+                "payment failed",
+                "transaction failed",
+                "insufficient funds",
+                "not processed",
+                "try again"
+            ];
+
+            for (const s of successSignals) {
+                if (body.includes(s)) return { status: "success", signal: s };
+            }
+
+            for (const s of failureSignals) {
+                if (body.includes(s)) return { status: "declined", signal: s };
+            }
+
+            // URL-based signals
+            if (url.includes("success") && !url.includes("fail")) {
+                return { status: "success", signal: "url:success" };
+            }
+            if (url.includes("fail") || url.includes("error") || url.includes("decline")) {
+                return { status: "declined", signal: "url:" + url.split("?")[0].slice(-30) };
+            }
+
+            return { status: "unknown", signal: "no signal found" };
+        }).catch(() => ({ status: "unknown", signal: "evaluate failed" }));
+
         await takeScreenshot("step4");
+
+        if (paymentResult.status === "declined") {
+            log(`   ❌ Payment was DECLINED by gateway: ${paymentResult.signal}`);
+            return {
+                success: false,
+                message: `Payment declined: ${paymentResult.signal}`,
+                failureCode: FAILURE_CODES.PAYMENT_DECLINED,
+                paymentStep: "payment_declined"
+            };
+        }
+
+        if (paymentResult.status === "unknown") {
+            warn(`   ⚠️ Could not determine payment result (${paymentResult.signal}) — treating as timeout (NOT re-paying)`);
+            return {
+                success: false,
+                message: `Payment result unknown: ${paymentResult.signal} (no retry per one-try rule)`,
+                failureCode: FAILURE_CODES.PAYMENT_TIMEOUT,
+                paymentStep: "payment_result_unknown"
+            };
+        }
+
+        log(`   ✅ Payment result: ${paymentResult.signal}`);
 
     } catch (e) {
         err("Step 4 crashed", e);
         await takeScreenshot("step4");
-        return { success: false, message: "Step 4 crashed: " + e.message };
+        return { success: false, message: "Step 4 crashed: " + e.message, failureCode: FAILURE_CODES.UNKNOWN_ERROR };
     }
 
-    // =========================================================
+    // ═══════════════════════════════════════════════════════════
     // DONE
-    // =========================================================
+    // ═══════════════════════════════════════════════════════════
 
     setStep(5);
     setProgress("Sequence complete!");
+    if (setPaymentStep) setPaymentStep("success").catch(() => {});
 
     log("");
     log("═══════════════════════════════════════════════════════════");

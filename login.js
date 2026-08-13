@@ -301,13 +301,13 @@ async function launchBrowser(silent = false) {
     if (!silent) log('🚀 Launching browser...');
     else log('   🚀 Launching browser (silent)...');
 
+    // v11: proxy comes from CONFIG.PROXIES with rotation support —
+    // never hard-coded. When the current tunnel fails, launchBrowser
+    // is called with a fresh profile AND a rotated proxy.
+    const proxy = getCurrentProxy();
+
     const launchOpts = {
         headless: true,
-        proxy: {
-            server: 'http://rp.infiniteproxies.com:1111',
-            username: 'u87453w6p',
-            password: 'a4NtWclFQS8B9S52Rurs_country-UnitedStates',
-        },
         args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',
@@ -318,6 +318,15 @@ async function launchBrowser(silent = false) {
         viewport: { width: 1280, height: 800 },
         userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
     };
+
+    if (proxy) {
+        launchOpts.proxy = {
+            server: proxy.server,
+            username: proxy.username,
+            password: proxy.password,
+        };
+        log(`   🌐 Proxy: ${proxy.name}`);
+    }
 
     if (fs.existsSync(SESSION_FILE)) {
         launchOpts.storageState = SESSION_FILE;
@@ -349,17 +358,65 @@ async function launchBrowser(silent = false) {
 //  QR LOGIN FUNCTIONS
 // ═══════════════════════════════════════════════════════════════════
 
-// ═══ Tunnel/network error detection ─══
-const TUNNEL_ERRORS = ['ERR_TUNNEL_CONNECTION_FAILED', 'ERR_PROXY_CONNECTION_FAILED', 'net::ERR_TUNNEL'];
+// ═══ ERROR CLASSIFICATION (v11) — sent to the backend so the
+//     website can show a useful failure message ═══
+const ERROR_CLASSES = {
+    NETWORK_ERROR: 'NETWORK_ERROR',                 // page/navigation generic net failure
+    PROXY_ERROR: 'PROXY_ERROR',                     // tunnel / proxy specific
+    LOGIN_ERROR: 'LOGIN_ERROR',                     // could not reach/parse login page
+    QR_ERROR: 'QR_ERROR',                           // QR extraction / scan timeout
+    SESSION_ERROR: 'SESSION_ERROR',                 // session check crashed / ambiguous
+    COINS_SELECTION_ERROR: 'COINS_SELECTION_ERROR', // package not available
+    PAYMENT_FORM_ERROR: 'PAYMENT_FORM_ERROR',       // iframe / form fields not fillable
+    PAYMENT_DECLINED: 'PAYMENT_DECLINED',           // issuer/gateway rejected
+    PAYMENT_TIMEOUT: 'PAYMENT_TIMEOUT',             // no confirmation in time
+    UNSUPPORTED_COIN_AMOUNT: 'UNSUPPORTED_COIN_AMOUNT' // requested coins not sold
+};
+
+function classifyError(message, context = '') {
+    const msg = String(message || '');
+    const ctx = String(context || '');
+    if (isTunnelError(msg) || msg.includes('ERR_PROXY_CONNECTION_FAILED')) return ERROR_CLASSES.PROXY_ERROR;
+    if (/net::|navigate|timeout|ENOTFOUND|ECONNREFUSED|ECONNRESET/i.test(msg) && !isTunnelError(msg)) return ERROR_CLASSES.NETWORK_ERROR;
+    if (ctx.includes('qr') || /qr/i.test(msg)) return ERROR_CLASSES.QR_ERROR;
+    if (ctx.includes('session') || ctx.includes('login')) return ERROR_CLASSES.LOGIN_ERROR;
+    if (ctx.includes('coins') || ctx.includes('package')) return ERROR_CLASSES.COINS_SELECTION_ERROR;
+    if (ctx.includes('iframe') || ctx.includes('card') || ctx.includes('payment form')) return ERROR_CLASSES.PAYMENT_FORM_ERROR;
+    if (ctx.includes('payment') && /declined|rejected|failed/i.test(msg)) return ERROR_CLASSES.PAYMENT_DECLINED;
+    if (ctx.includes('payment') && /timed?out/i.test(msg)) return ERROR_CLASSES.PAYMENT_TIMEOUT;
+    return ERROR_CLASSES.UNKNOWN_ERROR;
+}
+
+// ═══ PROXY ROTATION — use CONFIG.PROXIES instead of the hard-coded one ═══
+let currentProxyIndex = 0;
+
+function getCurrentProxy() {
+    const list = CONFIG.PROXIES || [];
+    if (list.length === 0) return null;
+    return list[currentProxyIndex % list.length];
+}
+
+function rotateProxy() {
+    const list = CONFIG.PROXIES || [];
+    if (list.length === 0) return;
+    currentProxyIndex = (currentProxyIndex + 1) % list.length;
+    warn(`🌐 Proxy rotated → ${list[currentProxyIndex].name}`);
+}
 
 function isTunnelError(message) {
     const msg = String(message || '');
-    return TUNNEL_ERRORS.some(p => msg.includes(p));
+    const msgLower = msg.toLowerCase();
+    return ['err_tunnel_connection_failed', 'err_proxy_connection_failed', 'net::err_tunnel',
+            'net::err_proxy_connection_failed', 'err_address_unreachable', 'err_internet_disconnected']
+        .some(p => msgLower.includes(p));
 }
 
 async function gotoWithTunnelRetry(pg, url, opts = {}) {
-    // Retry navigation when the proxy tunnel drops temporarily.
-    // Gives the tunnel server time to recover before giving up.
+    // v11 tunnel-recovery architecture (per requirements §14):
+    // Navigation Failed → close browser/context → switch proxy →
+    // create fresh browser context → retry navigation. Limited to
+    // a bounded number of full restarts (not blind re-goto on the
+    // same dead context).
     const attempts = opts.attempts || 3;
     const timeout = opts.timeout || 20000;
 
@@ -369,12 +426,28 @@ async function gotoWithTunnelRetry(pg, url, opts = {}) {
             return true;
         } catch (e) {
             const msg = String(e.message || '');
-            if (isTunnelError(msg) && i < attempts) {
-                warn(`   🌐 Tunnel failed (${msg.split(' at ')[0].replace('page.goto: ', '')}) — retrying in ${3 * i}s (${i}/${attempts})...`);
-                await sleep(3000 * i);
-                continue;
+            if (!isTunnelError(msg) || i >= attempts) throw e;
+
+            warn(`   🌐 Tunnel failed (${msg.split(' at ')[0].replace('page.goto: ', '')}) — full restart + proxy rotation (${i}/${attempts})...`);
+            rotateProxy();
+
+            // Close the dead context and create a fresh one with the
+            // rotated proxy (same profile dir, new context).
+            try { if (context) { await context.close(); } } catch {}
+            context = null;
+            page = null;
+
+            await sleep(3000 * i);
+
+            try {
+                await launchBrowser(true);
+                pg = page;
+            } catch (le) {
+                warn('   Browser relaunch failed: ' + le.message);
+                throw e; // propagate original tunnel error
             }
-            throw e;
+
+            if (!pg) throw e;
         }
     }
 
@@ -450,13 +523,42 @@ async function doQRLogin(pg) {
     }
 }
 
+// v11: REAL login verification (§23/§33). Generating a QR is NOT a
+// successful login. We wait until TikTok actually shows an
+// authenticated account on tiktok.com (user menu / profile elements),
+// and only then send LOGIN_SUCCESS to the backend.
+async function verifyTikTokAuthenticated(pg) {
+    try {
+        // Authenticated homepage signals: user menu with avatar,
+        // upload/profile icons that only exist for logged-in users.
+        return await pg.evaluate(() => {
+            const signals = [
+                // Logged-in header menu
+                document.querySelector('[data-e2e="user-profile-menu"]') !== null,
+                // Avatar present in the header area
+                !!document.querySelector('[data-e2e="user-avatar"]') &&
+                    document.querySelector('[data-e2e="user-avatar"]').getBoundingClientRect().height > 0,
+                // Upload button (only logged-in users can upload)
+                !!document.querySelector('[data-e2e="upload-btn"]'),
+                // Follow/Inbox icons appear only when authenticated
+                !!document.querySelector('[data-e2e="follow-icon"]'),
+                !!document.querySelector('[data-e2e="inbox-icon"]'),
+            ];
+            const hit = signals.filter(Boolean).length;
+            return hit >= 2; // at least two independent signals
+        }).catch(() => false);
+    } catch {
+        return false;
+    }
+}
+
 async function waitForQRScan(pg, timeoutMs = 120000) {
     const startTime = Date.now();
 
     while (Date.now() - startTime < timeoutMs) {
         try {
-            const isLoggedIn = await checkTikTokSession(pg);
-            if (isLoggedIn) {
+            const authenticated = await verifyTikTokAuthenticated(pg);
+            if (authenticated) {
                 return true;
             }
         } catch {}
@@ -488,11 +590,16 @@ function loadProcessedIds() {
 
 let persistedProcessedIds = loadProcessedIds();
 
+// ═══ Atomic save: write to .tmp then rename — immune to corruption
+//     from crashes mid-write (utils.writeJson pattern) ═══
 function saveProcessedIds() {
+    const tmpFile = PROCESSED_IDS_FILE + '.tmp';
     try {
-        fs.writeFileSync(PROCESSED_IDS_FILE, JSON.stringify([...persistedProcessedIds]));
+        fs.writeFileSync(tmpFile, JSON.stringify([...persistedProcessedIds]));
+        fs.renameSync(tmpFile, PROCESSED_IDS_FILE);
     } catch (e) {
         warn('Could not save processed IDs: ' + e.message);
+        try { fs.unlinkSync(tmpFile); } catch {}
     }
 }
 
@@ -511,7 +618,7 @@ setInterval(async () => {
         if (persistedProcessedIds.has(order.order_id)) {
             log('⏭️  Order already attempted before — skipping forever: ' + order.order_id);
             // Force it to "failed" so the website never offers it again
-            await worker.failOrder(order, 'already_attempted_skip');
+            await worker.failOrder(order, { message: 'already_attempted_skip', failureCode: 'DUPLICATE_ORDER' });
             return;
         }
 
@@ -522,6 +629,9 @@ setInterval(async () => {
             return;
         }
         log('🔒 Order claimed: ' + order.order_id + ' → processing');
+
+        // v11: start sending fine-grained status updates (step flow)
+        let paymentStep = 'awaiting_session';
 
         // ═══ Mark as attempted — irreversible for this process lifetime ═══
         persistedProcessedIds.add(order.order_id);
@@ -541,13 +651,17 @@ setInterval(async () => {
         }
 
         if (!sessionValid) {
+            paymentStep = 'login_required';
             log('⚠️ TikTok session expired — need QR login');
+            await worker.updateOrder(order, { status: 'processing', payment_step: paymentStep });
 
             const qrResult = await doQRLogin(page);
 
             if (qrResult.success && qrResult.link) {
                 await worker.sendLoginLink(order, qrResult.link);
                 log('📤 Login link sent to website');
+                paymentStep = 'qr_ready';
+                await worker.updateOrder(order, { status: 'processing', payment_step: paymentStep });
 
                 log('⏳ Waiting for user to scan QR (max 2 min)...');
                 const scanned = await waitForQRScan(page, 120000);
@@ -555,26 +669,46 @@ setInterval(async () => {
                 if (!scanned) {
                     // ═══ ONE-TRY RULE: user did not scan → fail, NO retry ═══
                     warn('QR scan timeout — order FAILED (user must re-confirm)');
-                    await worker.failOrder(order, 'qr_scan_timeout_no_retry');
+                    paymentStep = 'qr_scan_timeout';
+                    await worker.failOrder(order, { message: 'qr_scan_timeout_no_retry', paymentStep });
                     isRunning = false;
                     return;
                 }
 
-                log('✅ User scanned QR — session active');
+                // v11 REAL verification: authenticated signals detected
+                log('✅ TikTok login VERIFIED — account authenticated');
+                paymentStep = 'login_success';
+                await worker.updateOrder(order, { status: 'processing', payment_step: paymentStep });
                 try { await context.storageState({ path: SESSION_FILE }); } catch {}
             } else {
                 // QR extraction failed → fail, no retry
                 warn('QR login failed: ' + (qrResult.error || 'unknown'));
-                await worker.failOrder(order, 'qr_login_failed');
+                paymentStep = 'qr_failed';
+                await worker.failOrder(order, { message: 'qr_login_failed', paymentStep });
                 isRunning = false;
                 return;
             }
         } else {
+            paymentStep = 'login_success';
             log('✅ TikTok session is valid');
         }
 
+        // v11: send detailed steps BEFORE the payment sequence starts
+        paymentStep = 'coins_selecting';
+        await worker.updateOrder(order, { status: 'processing', payment_step: paymentStep }).catch(() => {});
+
         // ═══ Payment sequence — ANY step failure halts immediately ═══
         try {
+            // v11: step callbacks that push fine-grained state to backend
+            const setStateCb = {
+                setStep: (step) => { currentStep = step; },
+                setProgress: (message) => { progressMsg = message; },
+                setPaymentStep: async (step) => {
+                    paymentStep = step;
+                    try { await worker.updateOrder(order, { status: 'processing', payment_step: step }); } catch {}
+                }
+            };
+
             const result = await runFullSequence({
                 page,
                 CONFIG,
@@ -644,11 +778,13 @@ setInterval(async () => {
                 },
                 dumpIframe: async () => {
                     try {
-                        const iframe = page
-                            .frameLocator('iframe[src*="pipopay"]')
-                            .first();
+                        // v11: use the ACTUAL Frame object (not frameLocator,
+                        // which doesn't expose evaluate()) — this is the same
+                        // fix that cured "iframe.evaluate is not a function"
+                        const frame = page.frames().find(f => f.url().includes('pipopay')) || page.frames()[1];
+                        if (!frame) { warn('No inner frame found for dump'); return; }
 
-                        const info = await iframe.evaluate(() => ({
+                        const info = await frame.evaluate(() => ({
                             inputs: Array.from(document.querySelectorAll('input')).map(inp => ({
                                 placeholder: inp.placeholder,
                                 name: inp.name,
@@ -678,20 +814,15 @@ setInterval(async () => {
                         warn('Could not access iframe contents: ' + e.message);
                     }
                 },
-                getState: () => ({
-                    setStep: (step) => {
-                        currentStep = step;
-                    },
-                    setProgress: (message) => {
-                        progressMsg = message;
-                    }
-                })
+                getState: () => setStateCb
             });
 
             // ═══ Final verdict — ONE attempt only ═══
             if (!result?.success) {
                 warn('Payment sequence failed — order marked FAILED (no retry)');
-                await worker.failOrder(order, result?.message || 'payment_sequence_failed');
+                paymentStep = result?.paymentStep || paymentStep;
+                const code = result?.failureCode || classifyError(result?.message || '', paymentStep);
+                await worker.failOrder(order, { message: result?.message || 'payment_sequence_failed', paymentStep, failureCode: code });
             } else {
                 log('✅ Payment sequence completed — order marked COMPLETED');
                 await worker.completeOrder(order);
@@ -700,7 +831,8 @@ setInterval(async () => {
         } catch (e) {
             console.log(e);
             warn('Unexpected crash — order marked FAILED (no retry)');
-            await worker.failOrder(order, String(e));
+            const code = classifyError(String(e), paymentStep);
+            await worker.failOrder(order, { message: String(e), paymentStep, failureCode: code });
         }
 
         // ═══ CLEAN STATE: wipe TikTok session + browser profile after EACH order ═══

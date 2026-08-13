@@ -110,30 +110,47 @@ function releaseOrder() {
     global.CURRENT_ORDER = null;
 }
 
+// v11: failOrder accepts { message, paymentStep, failureCode } so the
+// website can display a precise failure reason to the merchant.
 async function failOrder(orderOrMessage, errorMessage = null) {
     // ── Explicit-order variant so failures never crash ──
     let order = null;
     let message = null;
+    let paymentStep = null;
+    let failureCode = null;
 
     if (typeof orderOrMessage === "object" && orderOrMessage?.order_id) {
         order = orderOrMessage;
-        message = errorMessage || "unknown";
+        const detail = errorMessage || {};
+        message = (typeof detail === "object" ? detail.message : detail) || "unknown";
+        paymentStep = detail?.paymentStep || null;
+        failureCode = detail?.failureCode || null;
     } else if (currentOrder) {
         order = currentOrder;
-        message = orderOrMessage || "unknown";
+        const detail = orderOrMessage || {};
+        message = (typeof detail === "object" ? detail.message : detail) || "unknown";
+        paymentStep = detail?.paymentStep || null;
+        failureCode = detail?.failureCode || null;
     } else {
         utils.error("failOrder: no order context");
         return;
     }
 
-    await updateOrder(order, {
+    const payload = {
         status: "failed",
         charge_status: "failed",
-        session_id: message
-    });
+        failure_message: message,
+        failure_code: failureCode || message
+    };
+
+    if (paymentStep) {
+        payload.payment_step = paymentStep;
+    }
+
+    await updateOrder(order, payload);
 
     utils.log(
-        `❌ Order ${order.order_id} marked as FAILED: ${message}`
+        `❌ Order ${order.order_id} marked as FAILED: ${message}${failureCode ? " [" + failureCode + "]" : ""}`
     );
 
     releaseOrder();
@@ -159,6 +176,7 @@ async function completeOrder(orderOrData = {}) {
     await updateOrder(order, {
         status: "completed",
         charge_status: "completed",
+        payment_step: "success",
         ...extraData
     });
 

@@ -189,6 +189,8 @@ async function failOrder(order, reason = "unknown") {
                     order_id: order.order_id,
                     status: "failed",
                     charge_status: "failed",
+                    failure_message: reason,
+                    failure_code: reason,
                     session_id: reason
                 }),
                 signal: AbortSignal.timeout(10000)
