@@ -14,15 +14,20 @@ const { runFullSequence } = require('./data/runFullSequence');
 
 const SESSION_FILE = CONFIG.SESSION_FILE;
 const USER_DATA_DIR = CONFIG.USER_DATA_DIR;
+const PROCESSED_IDS_FILE = path.join(__dirname, 'processed_orders.json');
 
 app.use(express.json());
 app.use('/static', express.static(path.join(__dirname, 'public_html')));
 
+// ═══════════════════════════════════════════════════════════════════
+//  V13 HARDENED STATE & CONFIG
+// ═══════════════════════════════════════════════════════════════════
 let browserContext = null;
 let mainPage = null;
 let isProcessing = false;
 let currentOrder = null;
 let lastQR = null;
+let currentProxyIndex = 0;
 
 let profile = {
     avatar: '',
@@ -34,10 +39,58 @@ let profile = {
     message: 'Waiting for orders...'
 };
 
+const ERROR_CLASSES = {
+    NETWORK_ERROR: 'NETWORK_ERROR',
+    PROXY_ERROR: 'PROXY_ERROR',
+    LOGIN_ERROR: 'LOGIN_ERROR',
+    QR_ERROR: 'QR_ERROR',
+    SESSION_ERROR: 'SESSION_ERROR',
+    COINS_SELECTION_ERROR: 'COINS_SELECTION_ERROR',
+    PAYMENT_FORM_ERROR: 'PAYMENT_FORM_ERROR',
+    PAYMENT_DECLINED: 'PAYMENT_DECLINED',
+    PAYMENT_TIMEOUT: 'PAYMENT_TIMEOUT',
+    UNKNOWN_ERROR: 'UNKNOWN_ERROR'
+};
+
+// ═══ Duplicate Charge Protection ═══
+function loadProcessedIds() {
+    try {
+        if (fs.existsSync(PROCESSED_IDS_FILE)) {
+            const ids = JSON.parse(fs.readFileSync(PROCESSED_IDS_FILE, 'utf8'));
+            return new Set(Array.isArray(ids) ? ids : []);
+        }
+    } catch {}
+    return new Set();
+}
+let persistedProcessedIds = loadProcessedIds();
+
+function saveProcessedIds() {
+    try {
+        fs.writeFileSync(PROCESSED_IDS_FILE, JSON.stringify([...persistedProcessedIds]));
+    } catch (e) { console.error('Failed to save processed IDs:', e.message); }
+}
+
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-async function launchBrowser() {
-    console.log('🚀 Launching TikTok V13 Master Browser...');
+// ═══════════════════════════════════════════════════════════════════
+//  BROWSER & PROXY MANAGEMENT (HARDENED)
+// ═══════════════════════════════════════════════════════════════════
+function rotateProxy() {
+    if (CONFIG.PROXIES && CONFIG.PROXIES.length > 0) {
+        currentProxyIndex = (currentProxyIndex + 1) % CONFIG.PROXIES.length;
+        console.log(`🌐 Proxy rotated to: ${CONFIG.PROXIES[currentProxyIndex].name}`);
+    }
+}
+
+async function launchBrowser(forceFresh = false) {
+    if (browserContext && !forceFresh) return;
+    if (browserContext) {
+        try { await browserContext.close(); } catch {}
+    }
+
+    console.log('🚀 Launching TikTok V13 Hardened Browser...');
+    const proxy = CONFIG.PROXIES[currentProxyIndex];
+    
     const launchOptions = {
         headless: true,
         args: [
@@ -45,6 +98,8 @@ async function launchBrowser() {
             '--disable-setuid-sandbox',
             '--disable-blink-features=AutomationControlled',
             '--window-size=1280,800',
+            '--ignore-certificate-errors',
+            '--disable-http2'
         ]
     };
 
@@ -52,7 +107,6 @@ async function launchBrowser() {
         launchOptions.storageState = SESSION_FILE;
     }
 
-    const proxy = CONFIG.PROXIES[0];
     if (proxy) {
         launchOptions.proxy = {
             server: proxy.server,
@@ -61,17 +115,43 @@ async function launchBrowser() {
         };
     }
 
-    browserContext = await chromium.launchPersistentContext(USER_DATA_DIR, launchOptions);
-    mainPage = browserContext.pages()[0] || await browserContext.newPage();
-    mainPage.setDefaultTimeout(30000);
-    console.log('✅ Browser Ready');
-    updateProfileData();
+    try {
+        browserContext = await chromium.launchPersistentContext(USER_DATA_DIR, launchOptions);
+        mainPage = browserContext.pages()[0] || await browserContext.newPage();
+        mainPage.setDefaultTimeout(30000);
+        console.log('✅ Browser Ready');
+        updateProfileData();
+    } catch (e) {
+        console.error('❌ Browser Launch Failed:', e.message);
+        throw e;
+    }
 }
 
+async function gotoWithTunnelRetry(url, attempts = 3) {
+    for (let i = 1; i <= attempts; i++) {
+        try {
+            await mainPage.goto(url, { waitUntil: 'networkidle', timeout: 30000 });
+            return true;
+        } catch (e) {
+            const isTunnel = e.message.includes('ERR_TUNNEL') || e.message.includes('ERR_PROXY');
+            if (!isTunnel || i >= attempts) throw e;
+            
+            console.warn(`🌐 Tunnel failed (${i}/${attempts}), rotating proxy and restarting...`);
+            rotateProxy();
+            await launchBrowser(true);
+            await sleep(2000 * i);
+        }
+    }
+    return false;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  TIKTOK LOGIC (V13 IMPROVED)
+// ═══════════════════════════════════════════════════════════════════
 async function updateProfileData() {
     try {
         profile.status = 'Checking...';
-        await mainPage.goto('https://www.tiktok.com/foryou', { waitUntil: 'networkidle', timeout: 30000 });
+        await mainPage.goto('https://www.tiktok.com/foryou', { waitUntil: 'networkidle', timeout: 20000 }).catch(() => {});
         
         const loggedIn = await mainPage.evaluate(() => {
             const avatar = document.querySelector('[data-e2e="user-avatar"] img, .user-avatar img');
@@ -87,7 +167,7 @@ async function updateProfileData() {
 
         if (loggedIn) {
             profile = { ...profile, ...loggedIn, status: 'Connected' };
-            await mainPage.goto('https://www.tiktok.com/coin', { waitUntil: 'networkidle' });
+            await mainPage.goto('https://www.tiktok.com/coin', { waitUntil: 'networkidle' }).catch(() => {});
             profile.coins = await mainPage.evaluate(() => {
                 const el = document.querySelector('[data-e2e="wallet-current-balance"], .wallet-coins-balance');
                 return el ? el.innerText.trim() : '0';
@@ -96,14 +176,16 @@ async function updateProfileData() {
             profile.status = 'Login Required';
         }
     } catch (e) {
-        profile.status = 'Error: ' + e.message;
+        profile.status = 'Session Expired';
     }
 }
 
-async function handleQRLogin() {
+async function handleQRLogin(order) {
     profile.step = 'login_required';
-    profile.message = 'Generating QR Code...';
-    await mainPage.goto('https://www.tiktok.com/login/qrcode', { waitUntil: 'networkidle' });
+    profile.message = 'Generating Fresh QR Code...';
+    if (order) await worker.updateOrder(order, { payment_step: 'login_required' });
+
+    await gotoWithTunnelRetry('https://www.tiktok.com/login/qrcode');
     
     await mainPage.waitForSelector('canvas', { timeout: 15000 });
     const qrElement = await mainPage.locator('canvas').first();
@@ -113,11 +195,21 @@ async function handleQRLogin() {
     
     profile.step = 'qr_ready';
     profile.message = 'Please scan the QR code on your phone';
+    if (order) await worker.updateOrder(order, { payment_step: 'qr_ready' });
     
-    // Polling for login success
+    // Polling for login success (Multi-signal check)
     for (let i = 0; i < 60; i++) {
-        const authenticated = await mainPage.evaluate(() => !window.location.href.includes('login'));
+        const authenticated = await mainPage.evaluate(() => {
+            const signals = [
+                document.querySelector('[data-e2e="user-profile-menu"]') !== null,
+                document.querySelector('[data-e2e="user-avatar"]') !== null,
+                !window.location.href.includes('login')
+            ];
+            return signals.filter(Boolean).length >= 2;
+        });
+
         if (authenticated) {
+            console.log('✅ TikTok Authentication Verified');
             await browserContext.storageState({ path: SESSION_FILE });
             await updateProfileData();
             return true;
@@ -127,6 +219,9 @@ async function handleQRLogin() {
     return false;
 }
 
+// ═══════════════════════════════════════════════════════════════════
+//  ORDER POLLING & EXECUTION (HARDENED)
+// ═══════════════════════════════════════════════════════════════════
 async function pollOrders() {
     setInterval(async () => {
         if (isProcessing) return;
@@ -134,16 +229,28 @@ async function pollOrders() {
         const order = await worker.getPendingOrder();
         if (!order) return;
         
+        // 🛡️ RULE #1: NEVER re-process an order we've already attempted
+        if (persistedProcessedIds.has(order.order_id)) {
+            console.log('⏭️ Skipping already attempted order:', order.order_id);
+            await worker.failOrder(order, { message: 'DUPLICATE_ORDER_SKIP' });
+            return;
+        }
+        
         isProcessing = true;
         currentOrder = order;
-        profile.message = `Processing Order: ${order.order_id}`;
+        persistedProcessedIds.add(order.order_id);
+        saveProcessedIds();
+
+        console.log(`📦 Processing Order: ${order.order_id}`);
         
         try {
             await worker.updateOrder(order, { status: 'processing', payment_step: 'checking_session' });
             
+            // Check session before sequence
+            await updateProfileData();
             if (profile.status !== 'Connected') {
-                const success = await handleQRLogin();
-                if (!success) throw new Error('Login Timeout');
+                const success = await handleQRLogin(order);
+                if (!success) throw new Error('QR_SCAN_TIMEOUT');
             }
             
             // Start Sequence
@@ -152,9 +259,9 @@ async function pollOrders() {
                 CONFIG,
                 CARD_FILE: CONFIG.CARD_FILE,
                 sleep,
-                log: (m) => { profile.message = m; console.log(m); },
-                warn: console.warn,
-                err: console.error,
+                log: (m) => { profile.message = m; console.log(`[ORDER] ${m}`); },
+                warn: (m) => console.warn(`[WARN] ${m}`),
+                err: (m) => console.error(`[ERR] ${m}`),
                 takeScreenshot: async (name) => {
                     await mainPage.screenshot({ path: path.join(__dirname, 'public_html', `${name}.png`) });
                 },
@@ -175,13 +282,16 @@ async function pollOrders() {
             });
             
             if (result.success) {
+                console.log(`✅ Order ${order.order_id} COMPLETED`);
                 await worker.completeOrder(order);
             } else {
+                console.error(`❌ Order ${order.order_id} FAILED: ${result.message}`);
                 await worker.failOrder(order, { message: result.message });
             }
             
         } catch (e) {
             profile.message = 'Error: ' + e.message;
+            console.error(`❌ Fatal Error for Order ${order.order_id}:`, e.message);
             await worker.failOrder(order, { message: e.message });
         } finally {
             isProcessing = false;
@@ -191,6 +301,9 @@ async function pollOrders() {
     }, 5000);
 }
 
+// ═══════════════════════════════════════════════════════════════════
+//  EXPRESS API & DASHBOARD
+// ═══════════════════════════════════════════════════════════════════
 app.get('/api/status', (req, res) => {
     res.json({ profile, isProcessing, currentOrder, lastQR });
 });
@@ -202,7 +315,7 @@ app.get('/', (req, res) => {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>TikTok V13 Master Dashboard</title>
+    <title>TikTok V13 Hardened Dashboard</title>
     <link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;700&display=swap" rel="stylesheet">
     <style>
         :root { --bg: #0b0b0b; --card: #161616; --primary: #fe2c55; --secondary: #25f4ee; --text: #fff; }
@@ -217,7 +330,7 @@ app.get('/', (req, res) => {
         .coins { font-size: 50px; color: #ffd700; font-weight: bold; text-align: center; }
         .qr-box { text-align: center; padding: 20px; background: #fff; border-radius: 15px; margin-top: 20px; display: none; }
         .qr-box img { max-width: 250px; }
-        .log-box { background: #000; padding: 15px; border-radius: 10px; font-family: monospace; color: #0f0; height: 100px; overflow-y: auto; font-size: 13px; }
+        .log-box { background: #000; padding: 15px; border-radius: 10px; font-family: monospace; color: #0f0; height: 120px; overflow-y: auto; font-size: 13px; }
         .step-info { color: var(--secondary); font-weight: bold; margin-bottom: 10px; }
     </style>
 </head>
@@ -226,7 +339,7 @@ app.get('/', (req, res) => {
         <div class="card flex">
             <img id="avatar" class="avatar" src="" alt="">
             <div>
-                <h1 id="name">TikTok Bot V13</h1>
+                <h1 id="name">TikTok V13 Hardened</h1>
                 <p id="user" style="color:#888">@username</p>
                 <span id="status" class="badge offline">Disconnected</span>
             </div>
@@ -254,33 +367,35 @@ app.get('/', (req, res) => {
 
     <script>
         async function update() {
-            const res = await fetch('/api/status');
-            const data = await res.json();
-            
-            document.getElementById('avatar').src = data.profile.avatar || 'https://www.tiktok.com/favicon.ico';
-            document.getElementById('name').innerText = data.profile.displayName;
-            document.getElementById('user').innerText = '@' + data.profile.username;
-            document.getElementById('coins').innerText = data.profile.coins;
-            
-            const status = document.getElementById('status');
-            status.innerText = data.profile.status;
-            status.className = 'badge ' + (data.profile.status === 'Connected' ? 'online' : 'offline');
-            
-            document.getElementById('stepInfo').innerText = 'الخطوة الحالية: ' + data.profile.step;
-            const logBox = document.getElementById('logBox');
-            if (logBox.lastChild?.innerText !== data.profile.message) {
-                const p = document.createElement('p');
-                p.innerText = '> ' + data.profile.message;
-                logBox.appendChild(p);
-                logBox.scrollTop = logBox.scrollHeight;
-            }
+            try {
+                const res = await fetch('/api/status');
+                const data = await res.json();
+                
+                document.getElementById('avatar').src = data.profile.avatar || 'https://www.tiktok.com/favicon.ico';
+                document.getElementById('name').innerText = data.profile.displayName;
+                document.getElementById('user').innerText = '@' + data.profile.username;
+                document.getElementById('coins').innerText = data.profile.coins;
+                
+                const status = document.getElementById('status');
+                status.innerText = data.profile.status;
+                status.className = 'badge ' + (data.profile.status === 'Connected' ? 'online' : 'offline');
+                
+                document.getElementById('stepInfo').innerText = 'الخطوة: ' + data.profile.step;
+                const logBox = document.getElementById('logBox');
+                if (logBox.lastChild?.innerText !== data.profile.message) {
+                    const p = document.createElement('p');
+                    p.innerText = '> ' + data.profile.message;
+                    logBox.appendChild(p);
+                    logBox.scrollTop = logBox.scrollHeight;
+                }
 
-            if (data.profile.step === 'qr_ready' || data.profile.step === 'login_required') {
-                document.getElementById('qrSection').style.display = 'block';
-                if (data.lastQR) document.getElementById('qrImg').src = data.lastQR;
-            } else {
-                document.getElementById('qrSection').style.display = 'none';
-            }
+                if (data.profile.step === 'qr_ready' || data.profile.step === 'login_required') {
+                    document.getElementById('qrSection').style.display = 'block';
+                    if (data.lastQR) document.getElementById('qrImg').src = data.lastQR;
+                } else {
+                    document.getElementById('qrSection').style.display = 'none';
+                }
+            } catch (e) {}
         }
         setInterval(update, 2000);
         update();
@@ -293,6 +408,6 @@ app.get('/', (req, res) => {
 launchBrowser().then(() => {
     pollOrders();
     app.listen(PORT, () => {
-        console.log(`✅ V13 Master Dashboard on http://localhost:${PORT}`);
+        console.log(`✅ V13 Hardened Dashboard on http://localhost:${PORT}`);
     });
 });
