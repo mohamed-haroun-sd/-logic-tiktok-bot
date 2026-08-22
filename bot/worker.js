@@ -78,11 +78,9 @@ async function claimOrder(order) {
         return false;
     }
 
-    // ═══ Atomic backend claim: mark order as "processing" so no
-    // other bot instance can ever pull it again ═══
-    const claimed = await updateOrder(order, {
-        status: "processing"
-    });
+    // Atomic backend claim: the server must transition the order once.
+    // A plain update is not enough because two workers can race after GET.
+    const claimed = await api.claimOrder(order);
 
     if (!claimed) {
         utils.error(

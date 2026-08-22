@@ -14,3 +14,7 @@ tiktok_secure_data/
 tiktok_user_data/
 backup_old/
 processed_orders.json
+runtime/
+*.storage.json
+*.tmp
+public_html/
