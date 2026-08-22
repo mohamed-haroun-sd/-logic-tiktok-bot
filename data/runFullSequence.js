@@ -48,7 +48,8 @@ async function runFullSequence({
     clickOne,
     fillInIframe,
     dumpIframe,
-    getState
+    getState,
+    order = null
 }) {
     const {
         setStep,
@@ -56,7 +57,7 @@ async function runFullSequence({
         setPaymentStep
     } = getState();
 
-    const ORDER = global.CURRENT_ORDER;
+    const ORDER = order || global.CURRENT_ORDER;
 
     if (!ORDER) {
         return { success: false, message: "No Current Order" };
@@ -157,64 +158,63 @@ async function runFullSequence({
 
         log(`   📦 Packages TikTok currently sells: ${JSON.stringify(packages)}`);
 
-        // ── v11: exact-match ONLY — never guess a wrong package ──
+        // Exact package first: never silently downgrade or overcharge.
         selectedPackage = packages.find(p => p.amount === coinAmount);
+        let coinClicked = false;
 
-        if (!selectedPackage) {
-            warn(
-                `   ⛔ Requested ${coinAmount} coins is NOT among the packages TikTok sells right now`
-            );
+        if (selectedPackage) {
+            selectedPrice = selectedPackage.price;
+            log(`   ✅ Exact package found: ${selectedPackage.amount} Coins (${selectedPrice || "price not shown"})`);
+            const formatted = selectedPackage.amount.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+            coinClicked = await page.locator(`[data-e2e="wallet-package-coin-num-${coinAmount}"]`).first().click({ force: true }).then(() => true).catch(() => false);
+            if (!coinClicked) {
+                coinClicked = await clickOne([`button:has-text("${formatted}")`, `button:has-text("${coinAmount}")`], `${coinAmount} Coins`);
+            }
+        } else {
+            // Custom quantities are supported only when TikTok exposes a real
+            // custom amount input. We never compose a nearby package.
+            const customSelectors = [
+                'input[data-e2e*="coin" i]',
+                'input[placeholder*="coin" i]',
+                'input[placeholder*="amount" i]',
+                'input[aria-label*="coin" i]',
+                'input[type="number"]'
+            ];
+            const customInput = page.locator(customSelectors.join(", ")).filter({ visible: true }).first();
+            if (await customInput.count().catch(() => 0)) {
+                try {
+                    await customInput.fill(String(coinAmount));
+                    await sleep(800);
+                    coinClicked = await clickOne([
+                        'button:has-text("Recharge")',
+                        'button:has-text("Buy")',
+                        '[data-e2e*="confirm" i]'
+                    ], `custom ${coinAmount} Coins`);
+                    selectedPackage = { amount: coinAmount, price: null, custom: true };
+                    log(`   ✅ TikTok custom amount input accepted: ${coinAmount}`);
+                } catch (error) {
+                    warn(`   Custom amount input failed: ${error.message}`);
+                }
+            }
+        }
+
+        if (!coinClicked) {
             await takeScreenshot("step1");
             return {
                 success: false,
-                message: `Package ${coinAmount} coins not available — TikTok sells: ${packages.map(p => p.amount).join(", ")}`,
-                failureCode: FAILURE_CODES.COINS_SELECTION_ERROR,
+                message: selectedPackage?.custom ? `Could not confirm custom package ${coinAmount} Coins` : `Package ${coinAmount} coins not available — TikTok sells: ${packages.map(p => p.amount).join(", ")}`,
+                failureCode: selectedPackage?.custom ? FAILURE_CODES.COINS_SELECTION_ERROR : "UNSUPPORTED_COIN_AMOUNT",
                 paymentStep: "coins_not_available"
             };
         }
 
-        selectedPrice = selectedPackage.price;
-
-        log(`   ✅ Exact package found: ${selectedPackage.amount} Coins (${selectedPrice || "price not shown"})`);
-
-        // ── Click the matching package (by role + text, not nth-child) ──
-        // ── v13: Use stable data-e2e selectors for coin packages ──
-        const coinClicked = await page.click(`[data-e2e="wallet-package-coin-num-${coinAmount}"], button:has-text("${coinAmount}")`).then(() => true).catch(() => false);
-        
-        if (!coinClicked) {
-            log(`   ⚠️ Direct e2e click failed, trying generic search for ${coinAmount}...`);
-            await clickOne(
-                [
-                    `button:has-text("${selectedPackage.amount.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ",")}")`,
-                    `button:has-text("${coinAmount}")`
-                ],
-                `${coinAmount} Coins`
-            );
-        }
-
-        if (!coinClicked) {
-            await takeScreenshot("step1");
-            return {
-                success: false,
-                message: `Could not click package ${coinAmount} Coins`,
-                failureCode: FAILURE_CODES.COINS_SELECTION_ERROR,
-                paymentStep: "coins_selection_failed"
-            };
-        }
-
-        // ── v11: verify the Total reflects the selection ──
         await sleep(1500);
-
         const totalOk = await page.evaluate(amount => {
             const body = document.body.innerText || "";
-            // Total should no longer be "0" after a valid selection
-            return /Total/.test(body) && !/Total\s+\$\s*0/.test(body);
+            const normalized = body.replace(/,/g, "");
+            return normalized.includes(String(amount)) && !/Total\s+\$\s*0/i.test(body);
         }, coinAmount).catch(() => false);
-
-        if (!totalOk) {
-            warn("   ⚠️ Total did not update after selection — will continue carefully");
-        }
-
+        if (!totalOk) warn("   ⚠️ Coin total could not be independently confirmed");
         await takeScreenshot("step1");
 
     } catch (e) {
